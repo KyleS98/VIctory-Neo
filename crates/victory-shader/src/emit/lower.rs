@@ -3958,6 +3958,10 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         let lane = if self.exchange.is_some() {
             self.console_lane()
+        } else if self.local && self.x.native.wave64 {
+            let t = self.console_thread();
+            let k63 = self.s.m.i32(63);
+            self.s.m.bin(self.s.entry, Bin::And, t, k63)
         } else {
             self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
         };
@@ -5864,7 +5868,53 @@ impl<'a> Lower<'a> {
                     self.x.res.lane_copied.contains(&site)
                 );
             }
-            return Err("a descriptor read only as data");
+            // No image instruction names this load. A material shader still
+            // reads the descriptor's size fields and then samples, so the
+            // fields are rebuilt as a 2D texture's (width, height, levels).
+            // A dword with no host value stays missing, as before.
+            let src = Source::Loaded { load: site, first: 0 };
+            let h = self.handle(site, &src, false, (2, 0x409))?;
+            let c = self.cur;
+            let i32t = self.s.t.i32;
+            let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+            let mip = self.s.m.i32(0);
+            let d = self
+                .s
+                .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+            let one = self.s.m.i32(1);
+            let dim = |l: &mut Self, k: u32| {
+                let x = l.s.m.extract(c, d, k);
+                l.s.m.bin(c, Bin::Sub, x, one)
+            };
+            let w = dim(self, 0);
+            let height = dim(self, 1);
+            let levels = dim(self, 3);
+            let k30 = self.s.m.i32(30);
+            let k2 = self.s.m.i32(2);
+            let k14 = self.s.m.i32(14);
+            let k16 = self.s.m.i32(16);
+            let mask = self.s.m.i32(0x3FFF);
+            let ty = self.s.m.i32(0xFAC | 9 << 28);
+            let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
+            let hi = self.s.m.bin(c, Bin::LShr, w, k2);
+            let hi = self.s.m.bin(c, Bin::And, hi, mask);
+            let ht = self.s.m.bin(c, Bin::Shl, height, k14);
+            let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
+            let last = self.s.m.bin(c, Bin::Shl, levels, k16);
+            let d3 = self.s.m.bin(c, Bin::Or, ty, last);
+            let words = [(1u32, d1), (2, d2), (3, d3)];
+            for k in 0..count {
+                match words.iter().find(|w| w.0 == k) {
+                    Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
+                    None => {
+                        if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                            self.vals.insert(v, Val::Missing(OTHER));
+                            self.stale.insert(v);
+                        }
+                    }
+                }
+            }
+            return Ok(());
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -7561,11 +7611,14 @@ impl<'a> Lower<'a> {
                     // this lane's bit of it. Exact where host lanes are
                     // the console's.
                     None if self.mask_data == MaskData::Console => {
-                        // Each host wave taken as a wave of its own has no
-                        // console lane numbers to pick the bits by.
-                        if self.local {
-                            return Err("a constant lane mask in a half-wave");
-                        }
+                        // Each host wave taken as a wave of its own still
+                        // knows its console lane numbers: console threads
+                        // fill waves in order, so a thread's console lane is
+                        // its console thread index in the group mod 64
+                        // (`lane_bit`). Exact: the bit only picks per lane.
+                        // (Three of the ray-tracing structure builder's
+                        // programs stopped here, which kept the whole
+                        // builder off, its stages running all or none.)
                         let m = mask.ok_or(UNTRACKED)?;
                         let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
                         // wave64: the register after it holds lanes 32-63.
@@ -9407,13 +9460,46 @@ impl<'a> Lower<'a> {
     /// interpolation with computed barycentrics, or P10 or P20): then its
     /// element is declared constant and read with `attributeAtVertex`.
     fn per_vertex(&self, row: u8) -> bool {
-        self.x.io.interps.iter().any(|(_, i)| match *i {
+        self.mixed_row(row) || self.x.io.interps.iter().any(|(_, i)| match *i {
             Interp::Weighted { attribute } => attribute.row == row,
             Interp::Vertex { attribute, vertex } => {
                 attribute.row == row && vertex != 2 && self.interpolated(row)
             }
             Interp::Interpolated { .. } => false,
         })
+    }
+
+    /// Whether register row `row` is read in ways one DXIL interpolation
+    /// mode cannot serve: two modes, or an interpolation beside a flat read
+    /// or an integer element. DXIL gives a row one mode (the console packs
+    /// by register alone, its code interpolating), so such a row is
+    /// declared constant and its interpolations weigh the vertices with
+    /// `SV_Barycentrics` (`shader::harmonize_input_rows` aligns the rest).
+    fn mixed_row(&self, row: u8) -> bool {
+        // `VICTORY_FIX_MIXED=0`: off, for comparisons.
+        if std::env::var_os("VICTORY_FIX_MIXED").is_some_and(|v| v == "0") {
+            return false;
+        }
+        let mut modes: Vec<u8> = Vec::new();
+        for (_, i) in &self.x.io.interps {
+            let m = match *i {
+                Interp::Interpolated { attribute, barycentric, .. } if attribute.row == row => {
+                    interp_mode(barycentric).unwrap_or(0)
+                }
+                Interp::Vertex { attribute, vertex: 2 } if attribute.row == row => 1,
+                _ => continue,
+            };
+            if !modes.contains(&m) {
+                modes.push(m);
+            }
+        }
+        let interpolates = modes.iter().any(|&m| m != 1);
+        let ints = self
+            .s
+            .inputs
+            .iter()
+            .any(|e| e.kind == 0 && e.row == Some(u32::from(row)) && e.comp != 9);
+        interpolates && (modes.len() > 1 || ints)
     }
 
     /// Whether the program interpolates attribute row `row` (so the
