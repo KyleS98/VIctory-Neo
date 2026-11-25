@@ -586,12 +586,17 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
 }
 
 /// The start of a present plane: frame token, then the plane's resources.
+/// The title passes an array of them, `PLANE_STRIDE` bytes apart (then the
+/// source and placement rectangles, color space, flags and more).
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
 }
+/// Bytes from one present plane's description to the next (as the Series
+/// S profile's two planes lie).
+const PLANE_STRIDE: usize = 72;
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -828,10 +833,34 @@ extern "system" fn present(
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+        // The second plane (the interface, with the Series S profile),
+        // blended over the first (`crate::compose`).
+        let interface = (planes > 1 && crate::compose::on())
+            // SAFETY: the title passes `planes` descriptions of PLANE_STRIDE bytes.
+            .then(|| unsafe { plane_parameters.cast::<u8>().add(PLANE_STRIDE).cast::<Plane>().as_ref() })
+            .flatten()
+            .filter(|p| p.count > 0 && !p.resources.is_null())
+            // SAFETY: the plane lists `count` resources.
+            .map(|p| unsafe { *p.resources })
+            .filter(|&r| r != resource)
+            .and_then(|r| crate::resource::host_resource(r).map(|t| (r, t)));
+        let interface_state = interface.map(|(r, _)| {
+            crate::resource::host_transition(r, PIXEL_SHADER_RESOURCE)
+                .map_or(PIXEL_SHADER_RESOURCE, |(_, before)| before)
+        });
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        let shown = host.present(
+            texture,
+            state,
+            interface.zip(interface_state).map(|((_, t), s)| (t, s)),
+            frame,
+        );
         crate::resource::host_transition(resource, state);
+        if let Some(((r, _), s)) = interface.zip(interface_state) {
+            crate::resource::host_transition(r, s);
+        }
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
@@ -869,6 +898,47 @@ fn present_shape(frame: u64, planes: u32, plane_parameters: *const Plane) {
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     if *last != Some(shape) {
         *last = Some(shape);
+        // The planes' descriptions as words (72 bytes each, as the
+        // console's headers lay them out), and each plane's first resource.
+        let mut raw = vec![0u8; 72 * planes.min(4) as usize];
+        if !plane_parameters.is_null() && crate::host::read_into(plane_parameters.cast(), &mut raw) {
+            let words: Vec<String> = raw.as_chunks::<8>().0.iter().map(|c| format!("{:x}", u64::from_le_bytes(*c))).collect();
+            tracing::info!(frame, words = %words.join(" "), "present planes, raw");
+            for i in 0..planes.min(4) as usize {
+                let at = 72 * i;
+                let count = u32::from_le_bytes(raw[at + 8..at + 12].try_into().unwrap());
+                let list = u64::from_le_bytes(raw[at + 16..at + 24].try_into().unwrap());
+                let mut first = [0u8; 8];
+                if count == 0 || list == 0 || !crate::host::read_into(list as *const u8, &mut first) {
+                    continue;
+                }
+                let resource = u64::from_le_bytes(first) as This;
+                // SAFETY: a live resource of ours, if `host_resource` knows it.
+                let d = crate::resource::host_resource(resource).map(|t| unsafe { t.GetDesc() });
+                // The source and placement rectangles (16 bytes each).
+                let rect = |at: usize| -> String {
+                    let ptr = u64::from_le_bytes(raw[at..at + 8].try_into().unwrap());
+                    let mut r = [0u8; 16];
+                    if ptr == 0 || !crate::host::read_into(ptr as *const u8, &mut r) {
+                        return "-".into();
+                    }
+                    let v: Vec<i32> = r.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c)).collect();
+                    format!("{v:?}")
+                };
+                let (src, dst) = (rect(at + 24), rect(at + 32));
+                tracing::info!(
+                    frame,
+                    plane = i,
+                    src = %src,
+                    dst = %dst,
+                    count,
+                    format = d.as_ref().map_or(-1, |d| d.Format.0),
+                    width = d.as_ref().map_or(0, |d| d.Width),
+                    height = d.as_ref().map_or(0, |d| d.Height),
+                    "present plane"
+                );
+            }
+        }
         let (planes, resources, format, width, height) = shape;
         tracing::info!(
             frame,
