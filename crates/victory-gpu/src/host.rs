@@ -5769,7 +5769,7 @@ impl Batch {
 /// snapshots (`crate::shadow::wide`).
 fn wide_textures() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0"))
 }
 
 /// Copies title memory at submission. The ranges were checked against their
