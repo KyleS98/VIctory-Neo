@@ -1883,6 +1883,23 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Since the last frame-rate line, why [`Shadow::merge_under_writes`]
+/// asked for a settle: the copy is not watched, the journal could not say
+/// what was written, the changed runs ran out, no snapshot; and the
+/// bytes of the copies those settles were for.
+static MERGE_REFUSED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// [`MERGE_REFUSED`], taken.
+pub(crate) fn merge_refused_stats() -> [u64; 5] {
+    [0, 1, 2, 3, 4].map(|i| MERGE_REFUSED[i].swap(0, Ordering::Relaxed))
+}
+
+fn refused(why: usize, len: u64) -> bool {
+    MERGE_REFUSED[why].fetch_add(1, Ordering::Relaxed);
+    MERGE_REFUSED[4].fetch_add(len, Ordering::Relaxed);
+    true
+}
+
 /// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
 /// one run, the gap's bytes included.
 fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
@@ -3367,7 +3384,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-            return true;
+            return refused(0, self.len);
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
@@ -3379,7 +3396,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                return true;
+                return refused(1, self.len);
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -3414,7 +3431,7 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = joined_over(changed_runs(title, held), merge_gap());
                     if runs.len() > *runs_left {
-                        return true;
+                        return refused(2, self.len);
                     }
                     *runs_left -= runs.len();
                     for (r, m) in runs {
@@ -3425,7 +3442,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
-                        return true;
+                        return refused(3, self.len);
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
                     // bytes at the copy's offsets (`writing`), and these
@@ -3705,6 +3722,12 @@ impl Shadow {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
         }
+    }
+
+    /// The start of the copy's CPU side (for a copy in the card's memory,
+    /// the mapping its changed bytes are sent up from).
+    pub(crate) fn cpu_data(&self) -> *const u8 {
+        self.data
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
