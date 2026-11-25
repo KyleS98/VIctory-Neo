@@ -1840,6 +1840,9 @@ fn rehash_runs() -> bool {
     }
 }
 
+/// Of `crate::scatter`: dwords put in by its pass, and its dispatches.
+pub(crate) static SCATTERED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
@@ -1890,6 +1893,9 @@ struct CardPlan {
     /// The `CardInflight::landed` its [`CARD_FETCH`] was told: which of its
     /// tickets got a slot ([`inflight_gets_slot`]).
     inflight_landed: u32,
+    /// The entries of small changed ranges its sync list reads
+    /// (`crate::scatter`), held until the submission has run.
+    scatter: Vec<crate::scatter::Slot>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -3027,7 +3033,10 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // flights twice a frame, 50 ms of the submitting thread.)
         static RUNS: OnceLock<usize> = OnceLock::new();
         let mut runs_left = *RUNS.get_or_init(|| {
-            std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
+            // With the small ones sent up in one pass (`crate::scatter`)
+            // many runs cost little: far more before a settle.
+            let default = if crate::scatter::on() { 1 << 16 } else { 512 };
+            std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(default, |n| n.clamp(1, 1 << 20))
         });
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
@@ -3474,6 +3483,22 @@ fn late_line(frames: f64) {
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
+        );
+        let r = crate::shadow::merge_refused_stats().map(|n| n as f64 / frames);
+        tracing::info!(
+            "settles asked by the merge under flights per frame: copy not watched {:.2}, journal could not say {:.2}, \
+             changed runs ran out {:.2}, no snapshot {:.2} (copies of {:.1} MB)",
+            r[0],
+            r[1],
+            r[2],
+            r[3],
+            r[4] / (1 << 20) as f64
+        );
+        let sc = [0, 1].map(|i| SCATTERED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "small changed ranges of card copies put in by one pass per frame (VICTORY_CARD_SCATTER): {:.0} dwords in {:.1} dispatches",
+            sc[0],
+            sc[1]
         );
     }
 }
@@ -4182,6 +4207,13 @@ impl Host {
                 landed = Some(landing);
             }
         }
+        // Small ranges through one pass (`crate::scatter`), unless the
+        // changed bytes come through the copy queue's landing buffer.
+        let scatter = (crate::scatter::on() && landed.is_none())
+            .then(|| crate::scatter::pass(&self.device))
+            .flatten();
+        let mut slot: Option<crate::scatter::Slot> = None;
+        let mut kept_slots: Vec<crate::scatter::Slot> = Vec::new();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -4201,15 +4233,63 @@ impl Host {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
+                        // The small ranges as masked dwords, if they all can be.
+                        let mut entries: Vec<[u32; 3]> = Vec::new();
+                        let small: Vec<(usize, usize)> = match scatter {
+                            Some(_) => ranges.iter().copied().filter(|&(a, b)| b - a <= crate::scatter::SMALL).collect(),
+                            None => Vec::new(),
+                        };
+                        let scattered = small.len() >= 4
+                            && crate::scatter::entries(shadow.cpu_data(), shadow.buffer.GetDesc().Width, &small, &mut entries);
+                        // Room for them: in the plan's slot, else a bigger one.
+                        let address = if scattered {
+                            let wanted = (entries.len() * 12) as u64;
+                            let address = slot.as_mut().and_then(|s| s.put(&entries));
+                            address.or_else(|| {
+                                let mut bigger = crate::scatter::take(self, wanted.saturating_mul(4))?;
+                                let address = bigger.put(&entries);
+                                // The full one is read by this list too:
+                                // it goes back with the plan.
+                                if let Some(old) = slot.replace(bigger) {
+                                    kept_slots.push(old);
+                                }
+                                address
+                            })
+                        } else {
+                            None
+                        };
+                        let scattered = address.is_some();
+                        let mut copied = false;
                         for &(a, b) in ranges {
+                            if scattered && b - a <= crate::scatter::SMALL {
+                                crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                                continue;
+                            }
                             match &landed {
                                 Some(landing) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
                                 None => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
                             }
+                            copied = true;
                             at += (b - a) as u64;
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        // The state the copy is in now: a copy promoted it
+                        // to a copy destination; a buffer starts each
+                        // submission in the common state.
+                        let mut state = if copied { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_COMMON };
+                        if let (Some(address), Some(pass)) = (address, scatter) {
+                            list.ResourceBarrier(&[transition(&shadow.buffer, state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                            state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                            list.SetComputeRootSignature(&pass.root);
+                            list.SetPipelineState(&pass.pso);
+                            list.SetComputeRoot32BitConstant(0, entries.len() as u32, 0);
+                            list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootShaderResourceView(2, address);
+                            list.Dispatch((entries.len() as u32).div_ceil(64), 1, 1);
+                            SCATTERED[0].fetch_add(entries.len() as u64, Ordering::Relaxed);
+                            SCATTERED[1].fetch_add(1, Ordering::Relaxed);
+                        }
                         let Some(before) = before else {
                             continue;
                         };
@@ -4219,10 +4299,10 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        if state != D3D12_RESOURCE_STATE_COMMON {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                state,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             )]);
                         }
@@ -4267,6 +4347,7 @@ impl Host {
             sent_as,
             inflight: false,
             inflight_landed: 0,
+            scatter: slot.into_iter().chain(kept_slots).collect(),
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -4401,7 +4482,10 @@ impl Host {
     /// ([`Host::card_back`]): its lists are free for the next plan. Called
     /// when nothing of ours is on the card, so the compare's results start
     /// from the beginning again.
-    fn card_done(&self, plan: CardPlan) {
+    fn card_done(&self, mut plan: CardPlan) {
+        for slot in plan.scatter.drain(..) {
+            crate::scatter::give(slot);
+        }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
             return;
