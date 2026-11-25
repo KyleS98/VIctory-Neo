@@ -172,7 +172,7 @@ fn mirror(handle: u64) {
 pub(crate) fn sync_heaps() {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_some_and(|v| v == "1")) {
         return;
     }
     let started = std::time::Instant::now();

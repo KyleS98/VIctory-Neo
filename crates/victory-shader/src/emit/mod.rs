@@ -544,7 +544,7 @@ pub fn emit(
         // one lane-branch region, ordered between the two host waves only where the region
         // is entered and left (`lower::with_loose_lds`, approximate). A 32-lane host refuses
         // the 64-lane form outright, which drops every dispatch of the program.
-        let loose_on = std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_none_or(|v| v != "0");
+        let loose_on = std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_some_and(|v| v == "1");
         if loose_on && !strict {
             let bases = [forms[0].1.as_ref(), forms[1].1.as_ref()];
             for (name, f) in [("without early-outs", bases[0]), ("without skips", bases[1])] {

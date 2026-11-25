@@ -429,7 +429,7 @@ pub(crate) fn keep_args() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_KEEP").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_KEEP").is_none_or(|v| v != "0"))
 }
 
 #[cfg(test)]
