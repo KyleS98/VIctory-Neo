@@ -2026,6 +2026,14 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        // The programs that walk the ray-tracing structures, while nothing
+        // builds them (`pipeline::walker_dropped`).
+        if crate::pipeline::walker_dropped(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a program that walks the ray-tracing structures, which are not built".to_owned());
+            return;
+        }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2868,6 +2876,13 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            return false;
+        }
+        // The structure walkers dispatch indirectly too (the screen-space
+        // trace and probe passes): `pipeline::walker_dropped`.
+        if crate::pipeline::walker_dropped(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a program that walks the ray-tracing structures, which are not built".to_owned());
             return false;
         }
         const DRAW: u32 = 0;
