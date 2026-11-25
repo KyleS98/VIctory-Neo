@@ -844,6 +844,13 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
 }
 
 /// Buffer to buffer: both are host memory, copied at submission.
+/// A command that writes buffers ends the indirect window of the list's
+/// draw state (`crate::draw::State::end_window`).
+#[cfg(windows)]
+fn writes_buffers(this: This) {
+    with_state(this, |_, s| s.end_window());
+}
+
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -852,6 +859,8 @@ extern "system" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
+    #[cfg(windows)]
+    writes_buffers(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
@@ -881,6 +890,7 @@ fn unlike(dst: This, src: This) -> bool {
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
+        writes_buffers(this);
         let Some(list) = host_list(this) else {
             return;
         };
@@ -1337,6 +1347,8 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    #[cfg(windows)]
+    writes_buffers(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
