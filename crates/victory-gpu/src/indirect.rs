@@ -444,7 +444,19 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
+    // With the card meter's pipeline table: the clamp's own line in it.
+    let timed = crate::cardmeter::pipelines().then(|| {
+        let name = match (ahead, count.is_some()) {
+            (true, _) => "the layer's clamp: a window ahead",
+            (false, true) => "the layer's clamp: records with a count",
+            (false, false) => "the layer's clamp: one record",
+        };
+        crate::cardmeter::begin_named(&list.list, name)
+    });
     let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    if let Some(span) = timed {
+        crate::cardmeter::end(&list.list, span);
+    }
     if recorded {
         list.indirect_readable(dst);
     }
