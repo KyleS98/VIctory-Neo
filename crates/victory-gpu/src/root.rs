@@ -195,6 +195,18 @@ pub(crate) extern "system" fn create(
     object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
 }
 
+/// The serialized form of root signature `this`; `None` if it is not one
+/// of ours.
+#[cfg(windows)]
+pub(crate) fn blob<'a>(this: This) -> Option<&'a [u8]> {
+    if !Object::has_table(this, &FUNCTIONS) {
+        return None;
+    }
+    // SAFETY: one of our root signatures, which live as long as the title
+    // holds them (it holds this one: it is making a pipeline with it).
+    Some(&unsafe { &*this.cast::<RootSignature>() }.blob)
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &ROOT_SIGNATURE_IIDS).then_some(this);
     object::answer(ROOT_SIGNATURE, iid, found, out)

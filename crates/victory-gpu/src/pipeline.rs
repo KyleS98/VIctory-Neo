@@ -627,6 +627,23 @@ pub(crate) extern "system" fn create_compute(
     )
 }
 
+/// Whether the compute `container` translates (the translation is kept,
+/// so the pipeline made from it next finds it).
+#[cfg(windows)]
+pub(crate) fn translates_compute(container: &[u8]) -> Result<(), String> {
+    match shader("compute", container).translated() {
+        Some(_) => Ok(()),
+        None => Err("does not translate".into()),
+    }
+}
+
+/// A compute pipeline from a program the title handed over without a
+/// container (device method 0x218, `prebuilt`), repacked as one.
+#[cfg(windows)]
+pub(crate) fn create_prebuilt_compute(container: &[u8], iid: *const Iid, out: *mut This) -> HRESULT {
+    hand_out(vec![shader("compute", container)], None, iid, out)
+}
+
 /// Device method 0x1f0: the plain compute description plus console
 /// extensions `(desc, extension count, extensions, iid, out)`.
 /// shortcut: the extensions (console shader settings) are ignored, as is

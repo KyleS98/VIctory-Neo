@@ -61,6 +61,19 @@ impl Object {
 
 pub(crate) type This = *const Object;
 
+impl Object {
+    /// Whether `this` is an object whose functions are `table`.
+    #[cfg(windows)]
+    pub(crate) fn has_table<const N: usize>(this: This, table: &'static Table<N>) -> bool {
+        // SAFETY: a non-null pointer the title passed as one of our objects;
+        // only its first word is read, through the kernel (it may be stale).
+        let mut first = [0u8; 8];
+        !this.is_null()
+            && crate::host::read_into(this.cast(), &mut first)
+            && usize::from_le_bytes(first) == table.0.as_ptr() as usize
+    }
+}
+
 #[repr(transparent)]
 pub(crate) struct Table<const N: usize>(pub [*const (); N]);
 // SAFETY: function addresses only.

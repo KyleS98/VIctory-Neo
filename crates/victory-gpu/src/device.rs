@@ -346,6 +346,81 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// `VICTORY_PREBUILT_COMPUTE=1`: method 0x218 makes its pipelines.
+/// shortcut: off by default. With them made, the prologue showed blocky
+/// orange patches the run without them lacks, and a pair of the bloom's
+/// programs (wave64, reading the wave index) washed the whole picture out
+/// white until those were refused (`prebuilt_compute`); the boot screens
+/// stay black either way (they draw with method 0x1c8's pipelines).
+#[cfg(windows)]
+fn prebuilt_compute_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PREBUILT_COMPUTE").is_some_and(|v| v == "1"))
+}
+
+/// The container for the compute program a 0x218 description names (see
+/// `victory_shader::prebuilt`): its registers, code and resource table,
+/// read out of title memory.
+#[cfg(windows)]
+fn prebuilt_compute(desc: *const u8) -> Result<Vec<u8>, String> {
+    let mut d = [0u8; 0x60];
+    if !crate::host::read_into(desc, &mut d) {
+        return Err("description not readable".into());
+    }
+    let word = |i: usize| u64::from_le_bytes(d[8 * i..8 * i + 8].try_into().unwrap());
+    let blob = |at: u64, len: u64, max: u64| -> Result<Vec<u8>, String> {
+        if at == 0 || len == 0 || len > max {
+            return Err(format!("implausible blob in the description: {at:#x} {len:#x}"));
+        }
+        let mut b = vec![0u8; len as usize];
+        if !crate::host::read_into(at as *const u8, &mut b) {
+            return Err("blob not readable".into());
+        }
+        Ok(b)
+    };
+    let registers = blob(word(1), word(2), 0x100)?;
+    let code = blob(word(5), word(6), 1 << 20)?;
+    let table = blob(word(7), word(8), 1 << 16)?;
+    let hex = |b: &[u8]| b.iter().take(64).map(|x| format!("{x:02x}")).collect::<String>();
+    let root = crate::root::blob(word(0) as This);
+    if root.is_none() {
+        return Err("the description's root signature is not one of ours".into());
+    }
+    let program = victory_shader::prebuilt::compute_program(&registers, &code, &table, root)
+        .map_err(|e| format!("{e}: registers {} table {}", hex(&registers), hex(&table)))?;
+    // shortcut: a wave64 program that reads the wave index (the group-info
+    // SGPR) is refused: with two of them (the bloom's downsample and its
+    // sibling) the picture washed out white, with all 44 refused it did not.
+    if let victory_shader::native::StageIo::Cs(cs) = &program.io
+        && program.wave64
+        && cs.system_sgprs().1.is_some()
+    {
+        return Err("a wave64 program that reads the wave index".into());
+    }
+    let container = victory_shader::prebuilt::container(&program).map_err(|e| e.to_string())?;
+    // Diagnostics (`VICTORY_PREBUILT_ONLY=<file>`): only the containers whose
+    // hashes (as logged) the file lists are made; the rest are refused.
+    {
+        use std::sync::OnceLock;
+        static ONLY: OnceLock<Option<std::collections::HashSet<String>>> = OnceLock::new();
+        let only = ONLY.get_or_init(|| {
+            let path = std::env::var_os("VICTORY_PREBUILT_ONLY")?;
+            let text = std::fs::read_to_string(path).ok()?;
+            Some(text.split_whitespace().map(str::to_ascii_lowercase).collect())
+        });
+        if let Some(only) = only {
+            let hash = blake3::hash(&container).to_hex()[..16].to_owned();
+            if !only.contains(&hash) {
+                return Err("not in VICTORY_PREBUILT_ONLY".into());
+            }
+        }
+    }
+    // One that does not translate is refused as before: the title copes
+    // with a pipeline it does not get, not with dispatches that do nothing.
+    crate::pipeline::translates_compute(&container)?;
+    Ok(container)
+}
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
@@ -359,12 +434,32 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
-    _iid: *const Iid,
+    iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    if SLOT == 0x218 && !desc.is_null() && !out.is_null() && prebuilt_compute_on() {
+        match prebuilt_compute(desc) {
+            Ok(container) => {
+                static MADE: AtomicU32 = AtomicU32::new(0);
+                let made = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+                if made <= 4 || made.is_power_of_two() {
+                    tracing::info!(made, bytes = container.len(), "compute pipeline from a prebuilt program (device method 0x218)");
+                }
+                return crate::pipeline::create_prebuilt_compute(&container, iid, out);
+            }
+            Err(why) => {
+                static FAILED: AtomicU32 = AtomicU32::new(0);
+                let failed = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+                if failed <= 8 || failed.is_power_of_two() {
+                    tracing::warn!(failed, %why, "a prebuilt compute program (device method 0x218) could not be read");
+                }
+            }
+        }
+    }
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
@@ -388,6 +483,31 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        // Diagnostics (`VICTORY_UNKNOWN_DUMP=<dir>`): the first calls' description and
+        // every blob it names as an address followed by a size, to files, for working
+        // out the layout offline.
+        #[cfg(windows)]
+        if calls <= 6
+            && let Some(dir) = std::env::var_os("VICTORY_UNKNOWN_DUMP")
+            && let Some(w) = description.as_ref()
+        {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let name = |what: &str| dir.join(format!("{SLOT:x}-{calls}-{what}.bin"));
+            let mut bytes = [0u8; 128];
+            if crate::host::read_into(desc, &mut bytes) {
+                let _ = std::fs::write(name("desc"), bytes);
+            }
+            for i in 0..w.len() - 1 {
+                let (at, len) = (w[i], w[i + 1]);
+                if (0x1_0000_0000..0x8000_0000_0000).contains(&at) && (1..=0x10_0000).contains(&len) {
+                    let mut blob = vec![0u8; len as usize];
+                    if crate::host::read_into(at as *const u8, &mut blob) {
+                        let _ = std::fs::write(name(&format!("w{i}-{at:x}")), blob);
+                    }
+                }
+            }
+        }
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,

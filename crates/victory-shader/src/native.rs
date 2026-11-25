@@ -356,7 +356,7 @@ pub enum RootType {
 }
 
 impl RootType {
-    fn from_raw(raw: u32) -> Self {
+    pub(crate) fn from_raw(raw: u32) -> Self {
         match raw {
             0 => RootType::Constants,
             1 => RootType::Descriptor,
@@ -715,6 +715,114 @@ fn le32(entry: &[u8], at: usize) -> u32 {
 fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
     let start = usize::try_from(offset).ok()?;
     data.get(start..start.checked_add(usize::try_from(len).ok()?)?)
+}
+
+/// An FSSM blob holding one compute program (the inverse of [`programs`]
+/// for that stage), for programs a title hands over without a container.
+pub(crate) fn fssm_compute(p: &NativeProgram, cs: &ComputeIo) -> Vec<u8> {
+    const STAGE_DATA: usize = CS_THREADS + 12;
+    let put32 = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_le_bytes());
+    let put64 = |v: &mut Vec<u8>, x: u64| v.extend_from_slice(&x.to_le_bytes());
+    let mut payload = GRAPHICS_SLOT_COUNT.to_le_bytes().to_vec();
+    payload.resize(0x68, 0);
+    for (stage, at) in SLOTS {
+        let v = if stage == HwStage::Cs { 0x68 } else { ABSENT };
+        payload[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let record = payload.len();
+    let layout_at = (record + RECORD_SIZE as usize + STAGE_DATA) as u64;
+    let used_at = layout_at + ENTRY_SIZE * p.layout.len() as u64;
+    let code_at = used_at + ENTRY_SIZE * p.used.len() as u64;
+    put64(&mut payload, code_at);
+    put64(&mut payload, p.code.len() as u64);
+    put32(&mut payload, 0);
+    put32(&mut payload, if p.wave64 { 0 } else { FLAG_WAVE32 });
+    payload.resize(record + RECORD_LAYOUT, 0);
+    put64(&mut payload, layout_at);
+    put64(&mut payload, used_at);
+    put32(&mut payload, p.layout.len() as u32);
+    put32(&mut payload, p.used.len() as u32);
+    payload.resize(record + RECORD_LDS, 0);
+    put32(&mut payload, cs.lds_bytes());
+    put32(&mut payload, u32::from(p.vgprs));
+    let stage_data = payload.len();
+    payload.resize(stage_data + CS_RSRC2, 0);
+    put32(&mut payload, cs.rsrc2);
+    for t in cs.threads {
+        put32(&mut payload, t);
+    }
+    for l in &p.layout {
+        let raw = |r: RootType| match r {
+            RootType::Constants => 0,
+            RootType::Descriptor => 1,
+            RootType::Table => 3,
+            RootType::ImmediateSampler => 4,
+            RootType::ResourceHeap => 5,
+            RootType::SamplerHeap => 6,
+            RootType::Other(n) => n,
+        };
+        put32(&mut payload, raw(l.root));
+        put32(&mut payload, l.table_offset_dwords);
+        put32(&mut payload, l.sgprs);
+        put32(&mut payload, l.base_register);
+        payload.extend_from_slice(&[l.user_data, l.slot, 0, 0]);
+    }
+    for u in &p.used {
+        let kind = match u.kind {
+            ResourceType::Srv => 0,
+            ResourceType::Sampler => 1,
+            ResourceType::Cbv => 2,
+            ResourceType::Uav => 3,
+            ResourceType::Other(n) => n,
+        };
+        let root = match u.root {
+            RootType::Constants => 0,
+            RootType::Descriptor => 1,
+            RootType::Table => 3,
+            RootType::ImmediateSampler => 4,
+            RootType::ResourceHeap => 5,
+            RootType::SamplerHeap => 6,
+            RootType::Other(n) => n as u8,
+        };
+        payload.extend_from_slice(&[kind, root, 0, 0]);
+        put32(&mut payload, u.table_offset_dwords);
+        put32(&mut payload, u.lower_bound);
+        put32(&mut payload, u.stride);
+        payload.extend_from_slice(&[u.dwords, u.user_data, u.slot, 0]);
+    }
+    payload.extend_from_slice(&p.code);
+    let mut out = b"FSSM".to_vec();
+    put32(&mut out, FSSM_VERSION);
+    put64(&mut out, payload.len() as u64);
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// `unpacked` zlib-packed as an XBCH blob.
+pub(crate) fn xbch(unpacked: &[u8]) -> Vec<u8> {
+    let mut buf = vec![0u8; zlib_rs::compress_bound(unpacked.len())];
+    let (stream, _) = zlib_rs::compress_slice(&mut buf, unpacked, zlib_rs::DeflateConfig::new(1));
+    let mut out = b"XBCH".to_vec();
+    out.extend_from_slice(&XBCH_VERSION.to_le_bytes());
+    out.extend_from_slice(&(stream.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(unpacked.len() as u64).to_le_bytes());
+    out.extend_from_slice(stream);
+    out
+}
+
+/// `DXIL` part data with no program header or bitcode, only an XDAT index
+/// naming `native`.
+pub(crate) fn xdat_part(native: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; XDAT_OFFSET];
+    out.extend_from_slice(b"XDAT");
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&0x24u32.to_le_bytes());
+    let offset = (out.len() + 12) as u32;
+    for v in [KIND_NATIVE, offset, native.len() as u32] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(native);
+    out
 }
 
 #[cfg(test)]
