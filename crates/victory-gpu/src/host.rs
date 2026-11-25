@@ -6,6 +6,7 @@
 //! overlap them with per-submission fences once more than clears run.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::os::windows::ffi::OsStrExt;
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -599,7 +600,9 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            pix_load();
+            let adapter = chosen_adapter()?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -654,8 +657,9 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let luid = device.GetAdapterLuid();
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
+            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(luid))
             .ok();
         tracing::info!("host D3D12 device ready");
         Ok(Host {
@@ -674,6 +678,291 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+/// `VICTORY_PIX=1` (or the path of a `WinPixGpuCapturer.dll`): PIX's GPU
+/// capturer is loaded before the device is made, which is what lets PIX for
+/// Windows take GPU captures of the host's D3D12 work (it cannot attach to a
+/// device made without it). With `1` the newest install under
+/// `C:\Program Files\Microsoft PIX` is used.
+fn pix_load() {
+    let Some(want) = std::env::var_os("VICTORY_PIX").filter(|v| !v.is_empty() && v != "0") else {
+        return;
+    };
+    let path = if want == "1" {
+        std::fs::read_dir(r"C:\Program Files\Microsoft PIX")
+            .ok()
+            .and_then(|dirs| {
+                dirs.flatten()
+                    .map(|d| d.path().join("WinPixGpuCapturer.dll"))
+                    .filter(|p| p.is_file())
+                    .max()
+            })
+    } else {
+        Some(std::path::PathBuf::from(want))
+    };
+    let Some(path) = path else {
+        tracing::warn!("VICTORY_PIX: no WinPixGpuCapturer.dll found; no GPU captures");
+        return;
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: a NUL-terminated path; the library stays loaded for the run.
+    match unsafe { windows::Win32::System::LibraryLoader::LoadLibraryW(PCWSTR(wide.as_ptr())) } {
+        Ok(_) => tracing::warn!(path = %path.display(), "PIX GPU capturer loaded"),
+        Err(e) => tracing::warn!(path = %path.display(), error = %e, "PIX GPU capturer did not load"),
+    }
+}
+
+/// At a present: `VICTORY_PIX_CAPTURE_AT=<seconds>,...` asks PIX's capturer
+/// (loaded by `VICTORY_PIX`) for a GPU capture of the next frames once each
+/// time comes, counted from the start of the run: `VICTORY_PIX_FRAMES`
+/// frames (1), written to `VICTORY_PIX_DIR` (the working directory) as
+/// `victory-<seconds>s.wpix`. Times rather than frame numbers: the frame a
+/// scene shows at varies from run to run, the `VICTORY_KEYS` script does
+/// not.
+fn pix_tick() {
+    use std::sync::atomic::AtomicUsize;
+    static TIMES: OnceLock<Vec<u64>> = OnceLock::new();
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let times = TIMES.get_or_init(|| {
+        let mut t: Vec<u64> = std::env::var("VICTORY_PIX_CAPTURE_AT")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        t.sort_unstable();
+        t
+    });
+    let i = NEXT.load(Ordering::Relaxed);
+    let Some(&at) = times.get(i) else {
+        return;
+    };
+    if now_ms() < at * 1000 {
+        return;
+    }
+    NEXT.store(i + 1, Ordering::Relaxed);
+    type CaptureNextFrame = unsafe extern "system" fn(PCWSTR, u32) -> windows::core::HRESULT;
+    // SAFETY: a module lookup and an export of PIX's capturer with the
+    // signature `pix3_win.h` gives it.
+    unsafe {
+        let Ok(module) = GetModuleHandleW(w!("WinPixGpuCapturer.dll")) else {
+            tracing::warn!("VICTORY_PIX_CAPTURE_AT without the PIX capturer (VICTORY_PIX=1)");
+            return;
+        };
+        let Some(f) = windows::Win32::System::LibraryLoader::GetProcAddress(
+            module,
+            windows::core::s!("CaptureNextFrame"),
+        ) else {
+            return;
+        };
+        let f: CaptureNextFrame = std::mem::transmute(f);
+        let frames = std::env::var("VICTORY_PIX_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1u32);
+        let dir = std::env::var_os("VICTORY_PIX_DIR").map(std::path::PathBuf::from).unwrap_or_default();
+        let file = dir.join(format!("victory-{at}s.wpix"));
+        let wide: Vec<u16> = file.as_os_str().encode_wide().chain([0]).collect();
+        let hr = f(PCWSTR(wide.as_ptr()), frames);
+        tracing::warn!(file = %file.display(), frames, hr = format_args!("{:#x}", hr.0), "PIX GPU capture asked for");
+    }
+}
+
+/// The adapter to render on. Two cards with the same name (two 3090 Tis)
+/// are told apart by the PCIe link: the widest link wins, so the card on
+/// an x1 link is not used just because DXGI lists it first.
+/// `VICTORY_ADAPTER` still filters by a case-insensitive part of the name.
+/// `VICTORY_ADAPTER_BUS` pins one PCI bus number.
+fn chosen_adapter() -> windows::core::Result<IDXGIAdapter> {
+    let want = std::env::var("VICTORY_ADAPTER")
+        .ok()
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase());
+    let bus_pin = std::env::var("VICTORY_ADAPTER_BUS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok());
+    // SAFETY: plain DXGI and display-driver queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let mut best: Option<(u32, usize, IDXGIAdapter1, String, u32)> = None;
+        let mut i = 0u32;
+        let mut saw_name = false;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            let desc = adapter.GetDesc1()?;
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
+            let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+            let name = String::from_utf16_lossy(&desc.Description[..len]);
+            let named = want.as_ref().is_none_or(|w| name.to_lowercase().contains(w));
+            if named {
+                saw_name = true;
+            }
+            let bus = adapter_bus(desc.AdapterLuid);
+            let width = bus.map(pci_link_width).unwrap_or(0);
+            let mb = desc.DedicatedVideoMemory / (1024 * 1024);
+            tracing::warn!(
+                index = i - 1,
+                adapter = %name,
+                pci_bus = bus.unwrap_or(u32::MAX),
+                link_width = width,
+                dedicated_mb = mb,
+                "host adapter"
+            );
+            if !named || bus_pin.is_some_and(|b| bus != Some(b)) {
+                continue;
+            }
+            let better = best.as_ref().is_none_or(|(w, mem, _, _, _)| {
+                width > *w || width == *w && desc.DedicatedVideoMemory > *mem
+            });
+            if better {
+                best = Some((width, desc.DedicatedVideoMemory, adapter, name, bus.unwrap_or(u32::MAX)));
+            }
+        }
+        if want.is_some() && !saw_name {
+            tracing::error!(want = want.unwrap_or_default(), "no adapter matches VICTORY_ADAPTER");
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_INVALIDARG,
+            ));
+        }
+        let Some((width, mem, adapter, name, bus)) = best else {
+            tracing::error!(?bus_pin, "no host adapter to render on");
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_FAIL,
+            ));
+        };
+        tracing::warn!(
+            adapter = %name,
+            pci_bus = bus,
+            link_width = width,
+            dedicated_mb = mem / (1024 * 1024),
+            "host device on the widest PCIe link"
+        );
+        adapter.cast()
+    }
+}
+
+/// PCI bus of a DXGI adapter, from the display driver's own record.
+fn adapter_bus(luid: windows::Win32::Foundation::LUID) -> Option<u32> {
+    #[repr(C)]
+    struct Open {
+        luid: windows::Win32::Foundation::LUID,
+        handle: u32,
+    }
+    #[repr(C)]
+    struct Addr {
+        bus: u32,
+        device: u32,
+        function: u32,
+    }
+    #[repr(C)]
+    struct Query {
+        handle: u32,
+        kind: i32,
+        data: *mut Addr,
+        size: u32,
+    }
+    #[repr(C)]
+    struct Close {
+        handle: u32,
+    }
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn D3DKMTOpenAdapterFromLuid(open: *mut Open) -> i32;
+        fn D3DKMTQueryAdapterInfo(query: *const Query) -> i32;
+        fn D3DKMTCloseAdapter(close: *const Close) -> i32;
+    }
+    // SAFETY: the structs match the WDDM layout; the handle is closed.
+    unsafe {
+        let mut open = Open { luid, handle: 0 };
+        if D3DKMTOpenAdapterFromLuid(&mut open) != 0 {
+            return None;
+        }
+        let mut addr = Addr { bus: 0, device: 0, function: 0 };
+        let query = Query {
+            handle: open.handle,
+            kind: 6, // KMTQAITYPE_ADAPTERADDRESS
+            data: &mut addr,
+            size: std::mem::size_of::<Addr>() as u32,
+        };
+        let ok = D3DKMTQueryAdapterInfo(&query) == 0;
+        let _ = D3DKMTCloseAdapter(&Close { handle: open.handle });
+        ok.then_some(addr.bus)
+    }
+}
+
+/// Current PCIe link width of the device on PCI `bus` (16, 8, 1, …). 0 if
+/// the bus has no such property.
+fn pci_link_width(bus: u32) -> u32 {
+    #[repr(C)]
+    struct Key {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+        pid: u32,
+    }
+    #[link(name = "cfgmgr32")]
+    unsafe extern "system" {
+        fn CM_Get_Device_ID_List_SizeW(len: *mut u32, filter: *const u16, flags: u32) -> u32;
+        fn CM_Get_Device_ID_ListW(filter: *const u16, buf: *mut u16, len: u32, flags: u32) -> u32;
+        fn CM_Locate_DevNodeW(node: *mut u32, id: *const u16, flags: u32) -> u32;
+        fn CM_Get_DevNode_PropertyW(
+            node: u32,
+            key: *const Key,
+            ty: *mut u32,
+            buf: *mut u8,
+            len: *mut u32,
+            flags: u32,
+        ) -> u32;
+    }
+    const FILTER: u32 = 0x0000_0001 | 0x0000_0100;
+    const BUS: Key = Key {
+        data1: 0xa45c_254e,
+        data2: 0xdf1c,
+        data3: 0x4efd,
+        data4: [0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0],
+        pid: 23,
+    };
+    const LINK: Key = Key {
+        data1: 0x3ab2_2e31,
+        data2: 0x8264,
+        data3: 0x4b4e,
+        data4: [0x9a, 0xf5, 0xa8, 0xd2, 0xd8, 0xe3, 0x3e, 0x62],
+        pid: 10,
+    };
+    let prop = |node: u32, key: &Key| -> Option<u32> {
+        let mut ty = 0u32;
+        let mut len = 4u32;
+        let mut value = 0u32;
+        // SAFETY: `node` came from Locate; the buffer is 4 bytes.
+        let rc = unsafe {
+            CM_Get_DevNode_PropertyW(node, key, &mut ty, (&mut value as *mut u32).cast(), &mut len, 0)
+        };
+        (rc == 0 && ty == 7).then_some(value)
+    };
+    // SAFETY: the list buffer is the size the call asked for.
+    unsafe {
+        let filter: Vec<u16> = "PCI".encode_utf16().chain([0]).collect();
+        let mut chars = 0u32;
+        if CM_Get_Device_ID_List_SizeW(&mut chars, filter.as_ptr(), FILTER) != 0 || chars < 2 {
+            return 0;
+        }
+        let mut buf = vec![0u16; chars as usize + 8];
+        if CM_Get_Device_ID_ListW(filter.as_ptr(), buf.as_mut_ptr(), chars, FILTER) != 0 {
+            return 0;
+        }
+        let mut widest = 0u32;
+        let mut at = 0usize;
+        while at < buf.len() && buf[at] != 0 {
+            let mut node = 0u32;
+            if CM_Locate_DevNodeW(&mut node, buf[at..].as_ptr(), 0) == 0
+                && prop(node, &BUS) == Some(bus)
+            {
+                widest = widest.max(prop(node, &LINK).unwrap_or(0));
+            }
+            at += buf[at..].iter().position(|&c| c == 0).unwrap_or(0) + 1;
+        }
+        widest
     }
 }
 
@@ -5989,7 +6278,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
-            tracing::info!(
+            tracing::warn!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
@@ -6172,6 +6461,7 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            pix_tick();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
@@ -6191,6 +6481,9 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        if let Some(adapter) = &self.adapter {
+            place_on_render_gpu(hwnd, adapter);
+        }
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
@@ -6224,6 +6517,46 @@ impl Host {
                 meter: Meter::new(),
             })
         }
+    }
+}
+
+/// Puts `hwnd` on a monitor plugged into `adapter`, so the picture is not
+/// copied across to another GPU for scan-out. Left alone when its monitor
+/// already is one: the window is the title's, and resizing it from this
+/// thread sends the title's thread size messages it is not ready for (a
+/// null write in the title at startup). Moved, never resized, otherwise.
+fn place_on_render_gpu(hwnd: HWND, adapter: &IDXGIAdapter3) {
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+    // SAFETY: output enumeration and a window move.
+    unsafe {
+        let current = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut first = None;
+        let mut i = 0;
+        while let Ok(output) = adapter.EnumOutputs(i) {
+            i += 1;
+            let Ok(desc) = output.GetDesc() else {
+                continue;
+            };
+            if desc.Monitor == current {
+                tracing::warn!(output = i - 1, "window already on a monitor of the render GPU");
+                return;
+            }
+            first.get_or_insert(desc.DesktopCoordinates);
+        }
+        let Some(r) = first else {
+            tracing::warn!("render GPU has no monitor; the window stays on whichever display is plugged in");
+            return;
+        };
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            r.left,
+            r.top,
+            0,
+            0,
+            SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        );
+        tracing::warn!(left = r.left, top = r.top, "window moved onto the render GPU's monitor");
     }
 }
 
