@@ -455,6 +455,9 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        if self.pixel && std::env::var_os("VICTORY_FIX_HARMONIZE").is_none_or(|v| v != "0") {
+            harmonize_input_rows(&mut self.inputs);
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // One interpolation mode per signature row, before the metadata
@@ -900,5 +903,37 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+/// Pixel inputs sharing a register row get one interpolation mode, as DXIL
+/// wants ("interpolation mode that differs from another element packed
+/// into the same row": 1,092 of Grand Theft Auto VI's pixel programs,
+/// among them the pedestrian materials). The console's compiler packs
+/// elements by register alone, since its shader code does the
+/// interpolation; here an element no code reads kept its default mode
+/// beside one read another way. Such an element takes the mode of the
+/// row's read elements (or, in a row nothing reads, constant when the row
+/// holds an integer). Rows whose reads themselves differ are made constant
+/// and interpolated by hand when lowered (`Lower::mixed_row`).
+pub(crate) fn harmonize_input_rows(inputs: &mut [SigElement]) {
+    let rows: std::collections::BTreeSet<u32> =
+        inputs.iter().filter(|e| e.kind == 0).filter_map(|e| e.row).collect();
+    for r in rows {
+        let of = |e: &SigElement| e.kind == 0 && e.row == Some(r);
+        let mut read: Vec<u8> = inputs.iter().filter(|e| of(e) && e.usage != 0).map(|e| e.interp).collect();
+        read.sort_unstable();
+        read.dedup();
+        let mode = match read[..] {
+            [m] => m,
+            [] if inputs.iter().any(|e| of(e) && e.comp != 9) => 1,
+            _ => continue,
+        };
+        for e in inputs.iter_mut().filter(|e| of(e) && e.usage == 0) {
+            // An integer is never interpolated.
+            if e.comp == 9 || mode == 1 {
+                e.interp = mode;
+            }
+        }
     }
 }

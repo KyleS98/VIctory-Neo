@@ -295,9 +295,44 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    /// The hash runs name the container being translated by (the first 16
+    /// hex digits of its BLAKE3), for [`wide_allowed`].
+    static CURRENT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Whether the container being translated may take its per-lane branches
+/// wave-wide ([`widen`]) though `VICTORY_WAVE_WIDE` is not 1: the form
+/// puts group barriers inside branches, and on some programs that hangs
+/// the card (runs 121-124; the screen-space tiling program
+/// `sr_tracing:CS_Tiling_Generate_Opaque`, 2cc4c197, removed the device as
+/// the world loaded). These are programs it was seen to run right; without
+/// it they keep 64-lane waves, which a 32-lane host refuses, and their
+/// passes never run: the shadow masks of the screen-space hair pass
+/// (`shadowmask:CS_GenerateShadowMasks*_SampleHairScreenSpace`), which
+/// translate, validate and get a pipeline this way. `VICTORY_WAVE_WIDE_ONLY=<hash>,...`
+/// replaces the list (empty: none).
+fn wide_allowed() -> bool {
+    const DEFAULT: &str = "2889c21328c69e58,888af37a584acf98";
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_else(|_| DEFAULT.to_owned())
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    CURRENT.with(|h| {
+        let h = h.borrow();
+        !h.is_empty() && list.iter().any(|w| h.starts_with(w.as_str()))
+    })
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    CURRENT.with(|h| *h.borrow_mut() = blake3::hash(container).to_hex()[..16].to_owned());
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -406,7 +441,8 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
+            || std::env::var_os("VICTORY_WAVE_WIDE").is_none() && wide_allowed();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {

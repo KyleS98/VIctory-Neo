@@ -382,7 +382,11 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        // The first half is P0 + i·P10. Recorded so a program
+                        // that reads it, not only the finished p2, still runs.
+                        ("v_interp_p1_f32", _) => {
+                            io.interps.push((site, Interp::Weighted { attribute }));
+                        }
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -402,7 +406,10 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {}
+                    "v_interp_p1ll_f16" => {
+                        let attribute = attribute(inst, &v.src[0])?;
+                        io.interps.push((site, Interp::Weighted { attribute }));
+                    }
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
@@ -460,6 +467,52 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
+    // A first half a second half completes is part of that interpolation
+    // (its `first`), not a read of its own: as one, every interpolated row
+    // read per vertex (`Lower::per_vertex`), so every pixel program
+    // weighed its inputs by hand.
+    let completed: std::collections::HashSet<Site> = io
+        .interps
+        .iter()
+        .flat_map(|(_, i)| match i {
+            Interp::Interpolated { first, .. } => first.clone(),
+            _ => Vec::new(),
+        })
+        .collect();
+    // Unless something besides a second half reads its result (8 of Grand
+    // Theft Auto VI's pixel programs): values read by other instructions,
+    // and through the phis that carry them.
+    let mut live: std::collections::HashSet<Value> = p
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|inst| !inst.name().starts_with("v_interp_p2"))
+        .flat_map(|inst| inst.reads.iter().map(|r| r.1))
+        .collect();
+    loop {
+        let before = live.len();
+        for phi in p.blocks.iter().flat_map(|b| b.phis.iter()) {
+            if live.contains(&phi.value) {
+                live.extend(phi.args.iter().copied());
+            }
+        }
+        if live.len() == before {
+            break;
+        }
+    }
+    // `VICTORY_FIX_P1=0`: every first half kept, for comparisons.
+    let keep_all = std::env::var_os("VICTORY_FIX_P1").is_some_and(|v| v == "0");
+    io.interps.retain(|(site, i)| {
+        if keep_all {
+            return true;
+        }
+        let inst = &p.blocks[site.0].insts[site.1];
+        let name = inst.name();
+        !(matches!(i, Interp::Weighted { .. })
+            && completed.contains(site)
+            && (name == "v_interp_p1_f32" || name == "v_interp_p1ll_f16")
+            && !inst.writes.iter().any(|w| live.contains(&w.1)))
+    });
     Ok(io)
 }
 
