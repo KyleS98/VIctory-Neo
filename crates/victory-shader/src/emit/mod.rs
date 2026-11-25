@@ -305,11 +305,37 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    CURRENT.with(|h| *h.borrow_mut() = blake3::hash(container).to_hex()[..16].to_owned());
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
         }
         other => other,
+    }
+}
+
+thread_local! {
+    /// The hash of the container being translated (as the layer logs it).
+    static CURRENT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Whether the loose-LDS form (`lower::with_loose_lds`, approximate) may be
+/// tried for the container being translated: `VICTORY_WAVE_LDS_LOOSE=1` for
+/// every program, `=0` for none, or a comma-separated list of container
+/// hashes; none by default. Tried for the transmission prefilter
+/// (`alphaResolve:CS_AlphTransmissionPrefilterMip`, 2da4beb386509b77),
+/// whose 64-lane form a 32-lane host refuses: its loose form made eyes glow
+/// white in the opening cutscene and left the noisy face as it was (run
+/// face1), as the loose form of all the refused programs did (run v4g).
+fn loose_lds_for_current() -> bool {
+    let v = std::env::var("VICTORY_WAVE_LDS_LOOSE").unwrap_or_default();
+    match v.as_str() {
+        "1" => true,
+        "0" | "" => false,
+        list => CURRENT.with(|h| {
+            let h = h.borrow();
+            list.split(',').any(|x| x.trim().eq_ignore_ascii_case(&h))
+        }),
     }
 }
 
@@ -499,6 +525,34 @@ pub fn emit(
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
+                if done(&local) {
+                    return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Last of all: LDS read and written inside one lane-branch region,
+        // ordered between the two host waves only where the region is
+        // entered and left (`lower::with_loose_lds`, approximate), for the
+        // programs [`loose_lds_for_current`] names.
+        if loose_lds_for_current() && !strict {
+            let bases = [forms[0].1.as_ref(), forms[1].1.as_ref()];
+            for (name, f) in [("without early-outs", bases[0]), ("without skips", bases[1])] {
+                if let Some((p, st, io, res)) = f {
+                    let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+                    report(&format!("loose LDS (APPROXIMATE), {name}"), &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+            }
+            let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+            report("loose LDS (APPROXIMATE)", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+            if local_on && !exact_only {
+                let local = lower::with_loose_lds(|| lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res)));
+                report("loose LDS + local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
                 }
