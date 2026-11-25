@@ -7872,12 +7872,16 @@ impl<'a> Lower<'a> {
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
-                        // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
-                        // first lane, exact when the value is the same in every lane of
-                        // the console wave (the ray-tracing builder's scans read a sum of
-                        // scalars this way, inside a loop whose exit is per console wave).
+                        // shortcut: the host wave's own first lane, exact when the value
+                        // is the same in every lane of the console wave. In the title's
+                        // 26,148 programs only three reach here, all the ray-tracing
+                        // builder's (XboxBvhBuilder.dll 0x99160, 0x9a830, 0x9be80): a
+                        // group's prefix sum over its waves, read as `s17 + LDS[s16]`
+                        // (a scalar plus LDS at a scalar address) inside a loop whose
+                        // exit is the wave's index, so per console wave. On by default
+                        // since they are exact; `VICTORY_FIRSTLANE_OWN=0` refuses it.
                         static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                        if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")) {
+                        if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_none_or(|v| v != "0")) {
                             return int(self, mine);
                         }
                         need(self.cur_ir);
