@@ -233,6 +233,55 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     off: false,
 });
 
+/// Whether `shaders` are a compute program that walks the ray-tracing
+/// structures (an `image_bvh_intersect_ray` or `image_bvh64_intersect_ray`
+/// in its console code): the shadow-ray, probe and reflection traces.
+#[cfg(windows)]
+fn walks_structures(shaders: &[Arc<Shader>]) -> bool {
+    use victory_shader::{Container, FourCC};
+    let [shader] = shaders else { return false };
+    if shader.stage != "compute" {
+        return false;
+    }
+    let Ok(c) = Container::parse(&shader.container) else {
+        return false;
+    };
+    let Some(part) = c.part(FourCC::DXIL) else {
+        return false;
+    };
+    let Ok(programs) = victory_shader::native_programs(part.data) else {
+        return false;
+    };
+    programs.iter().any(|native| {
+        victory_shader::spill::build(native).is_ok_and(|p| {
+            p.blocks
+                .iter()
+                .flat_map(|b| b.insts.iter())
+                .any(|i| i.name().starts_with("image_bvh"))
+        })
+    })
+}
+
+/// Whether the title's compute pipeline `this` walks the ray-tracing
+/// structures while nothing builds them. With the builder off (the default
+/// on 32-lane hosts, where it corrupts title memory: run "rt1") the
+/// structures hold whatever the memory held, and the programs that walk them
+/// left streaks and slabs of shadow across the frame once they translated
+/// (open PR #539 made 4 of the 5 shadow-ray traces translate). Dropped then,
+/// as they were while they did not translate. `VICTORY_BVH_WALKERS=1` runs
+/// them anyway.
+#[cfg(windows)]
+pub(crate) fn walker_dropped(this: This) -> bool {
+    static FORCE: OnceLock<bool> = OnceLock::new();
+    if this.is_null() || !pipeline(this).walks_bvh {
+        return false;
+    }
+    if *FORCE.get_or_init(|| std::env::var_os("VICTORY_BVH_WALKERS").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    !builder_runs()
+}
+
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
@@ -356,6 +405,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// A compute program that walks the ray-tracing structures
+    /// (`image_bvh*_intersect_ray`): see [`walker_runs`].
+    #[cfg(windows)]
+    walks_bvh: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -508,6 +561,8 @@ fn hand_out(
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
+    let walks_bvh = !builder && walks_structures(&shaders);
+    #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -521,6 +576,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        walks_bvh,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
