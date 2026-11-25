@@ -128,7 +128,49 @@ enum Console {
     SeriesS,
 }
 
+/// VIctory-Neo's defaults: the switches below are set to these values
+/// unless the environment already sets them (`VICTORY_NEO_DEFAULTS=0`:
+/// upstream's own defaults). Upstream keeps its measured frame-rate
+/// switches off by default; this is its switch set of run 253 with what
+/// came after (small buffers in the card's memory) and gathering by runs.
+/// Prologue cell, RTX 3090 Ti, Series S profile: 78-83 ms a frame with
+/// these over nine minutes (12-12.8 fps), 112 ms with the first five
+/// alone, about 150-170 ms with upstream's defaults.
+/// Not in the set: `VICTORY_CARD_HASH_LEN=1` (72-73 ms, but the print on
+/// the back of the prologue's shirt is gone with it: runs m3, neo1, neo2
+/// against m2 and neo3).
+fn neo_defaults() {
+    const DEFAULTS: &[(&str, &str)] = &[
+        ("VICTORY_INDIRECT_WINDOW", "1"),
+        ("VICTORY_JOIN_PARTS", "1"),
+        ("VICTORY_BACK_OWN_VIEW", "1"),
+        ("VICTORY_INDIRECT_GATHER", "1"),
+        ("VICTORY_CARD_REHASH_RUNS", "1"),
+        ("VICTORY_LEVELS_ON_DEMAND", "1"),
+        ("VICTORY_ASYNC_SUBMIT", "1"),
+        ("VICTORY_QUEUE2", "1"),
+        ("VICTORY_TEXTURE_NO_WAIT", "1"),
+        ("VICTORY_MERGE_GAP", "64"),
+        ("VICTORY_MERGE_RUNS", "4096"),
+        ("VICTORY_STAGING_POOL", "0"),
+        ("VICTORY_COPY_PLAIN", "1"),
+        ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
+        ("VICTORY_CARD_BUFFERS_MB", "1280"),
+    ];
+    if std::env::var_os("VICTORY_NEO_DEFAULTS").is_some_and(|v| v == "0") {
+        return;
+    }
+    for (name, value) in DEFAULTS {
+        if std::env::var_os(name).is_none() {
+            // SAFETY: the first thing `main` does: no other thread exists
+            // yet to read the environment.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    neo_defaults();
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
