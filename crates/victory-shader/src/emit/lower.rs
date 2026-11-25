@@ -7616,9 +7616,17 @@ impl<'a> Lower<'a> {
                         // fill waves in order, so a thread's console lane is
                         // its console thread index in the group mod 64
                         // (`lane_bit`). Exact: the bit only picks per lane.
-                        // (Three of the ray-tracing structure builder's
-                        // programs stopped here, which kept the whole
-                        // builder off, its stages running all or none.)
+                        // Opt-in (`VICTORY_LANE_MASK_LOCAL=1`): exact here,
+                        // but it lets four programs on to the APPROXIMATE
+                        // local-waves forms after it (three of the
+                        // ray-tracing builder's and a cascade-shadow one),
+                        // and the builder's approximate translation
+                        // corrupted title memory when it ran.
+                        if self.local
+                            && std::env::var_os("VICTORY_LANE_MASK_LOCAL").is_none_or(|v| v != "1")
+                        {
+                            return Err("a constant lane mask in a half-wave");
+                        }
                         let m = mask.ok_or(UNTRACKED)?;
                         let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
                         // wave64: the register after it holds lanes 32-63.
