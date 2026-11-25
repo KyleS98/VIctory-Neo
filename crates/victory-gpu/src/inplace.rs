@@ -437,8 +437,7 @@ pub(crate) fn back_own() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_BACK_OWN_VIEW").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
-        Ok("0") => 0,
-        _ => 1,
+        _ => 0,
     }) {
         0 => false,
         1 => true,

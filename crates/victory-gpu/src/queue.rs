@@ -585,8 +585,7 @@ fn join_parts() -> bool {
         let mode = match std::env::var("VICTORY_JOIN_PARTS").as_deref() {
             Ok("1") => 1,
             Ok("alt") => 2,
-            Ok("0") => 0,
-            _ => 1,
+            _ => 0,
         };
         if mode != 0 {
             tracing::info!(
