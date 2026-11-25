@@ -263,20 +263,21 @@ fn walks_structures(shaders: &[Arc<Shader>]) -> bool {
 }
 
 /// Whether the title's compute pipeline `this` walks the ray-tracing
-/// structures while nothing builds them. With the builder off (the default
-/// on 32-lane hosts, where it corrupts title memory: run "rt1") the
-/// structures hold whatever the memory held, and the programs that walk them
-/// left streaks and slabs of shadow across the frame once they translated
-/// (open PR #539 made 4 of the 5 shadow-ray traces translate). Dropped then,
-/// as they were while they did not translate. `VICTORY_BVH_WALKERS=1` runs
-/// them anyway.
+/// structures while nothing builds them, and is to be dropped. With the
+/// builder off (the default on 32-lane hosts, where it corrupts title
+/// memory: run "rt1") the structures hold whatever the memory held, and the
+/// walkers left streaks of shadow across some frames once #539 made them
+/// translate. Dropping them cost more than it saved, though: the prologue's
+/// yard and its inmates, the shirt print and wall detail were gone (two
+/// runs with them, two without; the one that reached the cell ran at 7.5
+/// fps on the Series S profile). So they run unless `VICTORY_BVH_WALKERS=0`.
 #[cfg(windows)]
 pub(crate) fn walker_dropped(this: This) -> bool {
-    static FORCE: OnceLock<bool> = OnceLock::new();
+    static DROP: OnceLock<bool> = OnceLock::new();
     if this.is_null() || !pipeline(this).walks_bvh {
         return false;
     }
-    if *FORCE.get_or_init(|| std::env::var_os("VICTORY_BVH_WALKERS").is_some_and(|v| v == "1")) {
+    if !*DROP.get_or_init(|| std::env::var_os("VICTORY_BVH_WALKERS").is_some_and(|v| v == "0")) {
         return false;
     }
     !builder_runs()
