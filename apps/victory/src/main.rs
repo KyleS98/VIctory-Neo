@@ -156,6 +156,15 @@ fn neo_defaults() {
         ("VICTORY_COPY_PLAIN", "1"),
         ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
         ("VICTORY_CARD_BUFFERS_MB", "1280"),
+        // 2026-11-26, measured in the prologue's cell on the Series S
+        // profile (RTX 3090 Ti): what shaders write to write-combining
+        // buffers of 1 MiB and more is not fetched back (73 -> 67 ms);
+        // every slot of a per-draw table is a table's slot (60 -> 53 ms);
+        // a part that reads what joined parts write is not joined behind
+        // them (the print on the shirt is back, 53 -> 55 ms).
+        ("VICTORY_SKIP_WC_BACK", "1"),
+        ("VICTORY_TABLED_ALL", "1"),
+        ("VICTORY_JOIN_READS", "1"),
     ];
     if std::env::var_os("VICTORY_NEO_DEFAULTS").is_some_and(|v| v == "0") {
         return;
