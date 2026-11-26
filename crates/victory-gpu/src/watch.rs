@@ -1119,6 +1119,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
     #[cfg(feature = "diagnostics")]
     crate::backreads::remapped(at, len);
+    #[cfg(feature = "diagnostics")]
+    crate::bvhtrace::note(|| format!("remapped	{at:#x}	{len:#x}"));
     crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.

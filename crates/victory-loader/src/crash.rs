@@ -447,6 +447,47 @@ unsafe fn thrown(p: &[usize]) -> String {
     }
 }
 
+/// `VICTORY_CRASH_MEMORY`: 0 (unset), 1 or 2; see [`report`].
+fn crash_memory() -> u32 {
+    static DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("VICTORY_CRASH_MEMORY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// The eight quadwords at `at`, read through the kernel (a page that is
+/// not there, or guarded, fails the read instead of faulting in the
+/// handler); none for an address that is no user pointer or cannot be read.
+fn quadwords(at: usize) -> Option<[u64; 8]> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if !(0x1_0000..0x7fff_ffff_0000).contains(&at) {
+        return None;
+    }
+    let mut words = [0u64; 8];
+    let mut done = 0usize;
+    // SAFETY: reads our own process into a buffer of that size; the kernel
+    // checks the source.
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            at as *const _,
+            words.as_mut_ptr().cast(),
+            size_of_val(&words),
+            &mut done,
+        )
+    };
+    (ok != 0 && done == size_of_val(&words)).then_some(words)
+}
+
+fn hex_words(words: &[u64]) -> String {
+    let hex: Vec<_> = words.iter().map(|w| format!("{w:016x}")).collect();
+    hex.join(" ")
+}
+
 /// # Safety
 /// See [`report_unhandled`].
 unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
@@ -508,6 +549,53 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     ));
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
+    }
+    // `VICTORY_CRASH_MEMORY=1`: the memory each register points at (64
+    // bytes as quadwords); `=2`: also what those quadwords point at. An
+    // access violation through a pointer read out of an object names the
+    // bad pointer, not the object that held it or what else lay in it.
+    let depth = crash_memory();
+    if depth > 0 {
+        let registers = [
+            ("rax", context.Rax),
+            ("rbx", context.Rbx),
+            ("rcx", context.Rcx),
+            ("rdx", context.Rdx),
+            ("rsi", context.Rsi),
+            ("rdi", context.Rdi),
+            ("rbp", context.Rbp),
+            ("r8", context.R8),
+            ("r9", context.R9),
+            ("r10", context.R10),
+            ("r11", context.R11),
+            ("r12", context.R12),
+            ("r13", context.R13),
+            ("r14", context.R14),
+            ("r15", context.R15),
+        ];
+        let mut seen = Vec::new();
+        for (name, value) in registers {
+            let at = value as usize & !7;
+            let Some(words) = quadwords(at) else { continue };
+            if seen.contains(&at) {
+                continue;
+            }
+            seen.push(at);
+            line(format!("  [{name}] {at:#x}: {}", hex_words(&words)));
+            if depth < 2 {
+                continue;
+            }
+            for (i, &w) in words.iter().enumerate() {
+                let to = w as usize & !7;
+                if seen.contains(&to) {
+                    continue;
+                }
+                if let Some(inner) = quadwords(to) {
+                    seen.push(to);
+                    line(format!("    [{name}+{:#x}] {to:#x}: {}", i * 8, hex_words(&inner)));
+                }
+            }
+        }
     }
     if to_file {
         let said = title_output();

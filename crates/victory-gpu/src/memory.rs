@@ -57,6 +57,14 @@ use crate::shadow::Shadow;
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
 const COPIES: u32 = 1023;
+/// Windows of memory past the directory's reach that can have stand-in
+/// pages ([`Memory::far`]), and a window's pages.
+const FAR_WINDOWS: u64 = 256;
+const FAR_PAGES: u64 = CELL / PAGE;
+/// The first stand-in page: the directory's top, below its last entry.
+/// Title addresses from here up (112 GiB) are taken for memory past the
+/// directory.
+const FAR_FIRST: u64 = MEMORY_PAGES as u64 - 64 - FAR_WINDOWS * FAR_PAGES;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -75,6 +83,10 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// Memory past the directory's reach that a root view names
+    /// ([`Memory::far`]): by the window's start, the directory page its
+    /// stand-in pages begin at.
+    far: HashMap<u64, u64>,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -111,6 +123,7 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            far: HashMap::new(),
         })
     }
 
@@ -231,6 +244,70 @@ impl Memory {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
     }
+
+    /// A root view at an address the directory does not reach (128 GiB and
+    /// up: the structure builder is given tables in the memory of its own
+    /// library, which on this host lies far above the title's): the
+    /// window around it gets a number and [`FAR_PAGES`] stand-in pages at
+    /// the directory's top, and the address in those pages is what the
+    /// shader is told (`far_address`). None if there is no room left or
+    /// the window cannot be had.
+    fn far(&mut self, address: u64) -> Option<u64> {
+        let cell = address & !(CELL - 1);
+        let first = match self.far.get(&cell) {
+            Some(&first) => first,
+            None => {
+                let taken = self.far.len() as u64;
+                if taken >= FAR_WINDOWS || self.copies.len() >= COPIES as usize {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!("title memory by address: no stand-in pages left for memory past the directory; a root view there reads zeros")
+                    });
+                    return None;
+                }
+                if !crate::texture::committed((address & !(PAGE - 1)) as *const u8, PAGE as usize) {
+                    return None;
+                }
+                let shadow = crate::shadow::find(cell, 1).filter(|s| s.offset_in(cell) == Some(0) && s.left(cell) >= CELL)?;
+                // SAFETY: a live buffer.
+                let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+                if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+                    return None;
+                }
+                let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
+                    Some(n) => n,
+                    None => {
+                        self.copies.push(shadow);
+                        self.copies.len() - 1
+                    }
+                };
+                let first = FAR_FIRST + taken * FAR_PAGES;
+                for k in 0..FAR_PAGES {
+                    // SAFETY: inside the directory's mapping (below its
+                    // last entry, which stays empty); the offset first.
+                    unsafe {
+                        let entry = self.directory.1.add(((first + k) * 2) as usize);
+                        entry.add(1).write_volatile((k * PAGE) as u32);
+                        entry.write_volatile(n as u32 + 1);
+                    }
+                }
+                self.far.insert(cell, first);
+                first
+            }
+        };
+        Some(first * PAGE + (address - cell))
+    }
+}
+
+/// The address a shader is told for the root view at `address`: the
+/// address itself, or for memory past the directory's reach its stand-in
+/// ([`Memory::far`]; 0 if there is none).
+pub(crate) fn far_address(address: u64) -> u64 {
+    if address / PAGE < FAR_FIRST {
+        return address;
+    }
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_mut().and_then(|m| m.far(address)).unwrap_or(0)
 }
 
 /// Before a draw whose shader reads title memory by address: what its
@@ -259,7 +336,13 @@ pub(crate) fn ready(
     }
     let numbered = m.copies.len();
     for &address in addresses {
-        m.name(address);
+        // (a root view may lie past the directory's reach; a constant that
+        // looks like such an address is not followed there)
+        if address / PAGE >= FAR_FIRST {
+            m.far(address);
+        } else {
+            m.name(address);
+        }
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names

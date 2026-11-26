@@ -207,6 +207,10 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    /// While one buffer access through a root view is lowered by address
+    /// ([`Lower::root_by_address`]): the handle of the host copy that holds
+    /// the access's page, which [`Lower::handle`] then gives.
+    by_address: Option<V>,
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
@@ -234,6 +238,12 @@ struct Lower<'a> {
     /// loop a lane can be cut out of): the barrier there keeps its fences
     /// and does not wait for the group ([`super::group_sync`]).
     fence_only: HashSet<usize>,
+    /// A console wave run as two host waves whose buffer stores wait for the other half
+    /// ([`buffers_meet`]): per IR block whether every lane runs it.
+    buffer_meet: Option<Vec<bool>>,
+    /// With `buffer_meet`, in the block being lowered: a buffer was read (or may have been,
+    /// before the block) since the host waves last met.
+    buffer_read: bool,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
@@ -815,6 +825,47 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     pass(&mut kind, &mut firsts, true)
 }
 
+/// Whether a program's lanes start in EXEC only below the dispatch's thread count
+/// (`structure::set_entry_limited`; `VICTORY_THREAD_LIMIT=0`: every lane, as before): the
+/// compute programs with a spilled user-data table, the console's ray-tracing structure
+/// builder, whose in-place stages are dispatched by thread counts.
+pub(super) fn thread_limited(native: &NativeProgram) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_LIMIT").is_none_or(|v| v != "0"))
+        && native.stage == HwStage::Cs
+        && crate::spill::is_spilled(native)
+}
+
+/// Whether the two host waves of a console wave meet (a group barrier) before a buffer store
+/// that follows buffer reads (`VICTORY_BUFFERS_MEET`: `0` never, `1` in every wave64 program
+/// run as two host waves; by default in the programs with a spilled user-data table, the
+/// console's ray-tracing structure builder).
+///
+/// The console runs a wave's lanes in step: every lane's load at one instruction is done
+/// before any lane's store at a later one. The builder's in-place stages rely on it: a group
+/// is one wave of 64 threads over one 8 KiB block, each lane reads its record from the block
+/// (a header dword at lane x 4, child lists behind them) and then stores its 128-byte node at
+/// lane x 128 of the same block. Run as two host waves of 32 nothing kept that order: one half
+/// stored its nodes over the records the other half had not read yet, which then built its
+/// nodes from them and stored through the offsets it found there (megabytes of boxes over
+/// whatever lay in reach; the title died on them within a second of the first build). LDS had
+/// this rule already (`lds_meetings`); this is the same for buffer memory, where every lane
+/// runs the store (a barrier in a lane branch would hang the group).
+/// shortcut: a store in a lane branch's region is not ordered, nor a load after another
+/// half's store.
+fn buffers_meet(native: &NativeProgram) -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_BUFFERS_MEET").ok().as_deref().map(str::trim) {
+        Some("0") => 0,
+        Some("1") => 1,
+        _ => 2,
+    }) {
+        0 => false,
+        1 => true,
+        _ => crate::spill::is_spilled(native),
+    }
+}
+
 /// The mode of a group barrier the translation adds (host waves meeting):
 /// a wait for the group with a shared-memory fence; the fence alone with
 /// `VICTORY_GROUP_SYNC=0` ([`super::group_sync`]).
@@ -935,6 +986,27 @@ fn lane_constant_masks(st: &Structured) -> bool {
 /// The widest wave the host GPU runs (0: not known – no host-specific forms); see
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether the root views of programs with a spilled user-data table (the
+/// console's ray-tracing structure builder) are reached by address, through
+/// the directory of title memory (`Lower::memory`), and not through a view
+/// the host binds (`VICTORY_ROOT_BY_ADDRESS=0`: through the view, as before).
+///
+/// A console root view is an address without a size. The host binds a view
+/// of the host copy that holds the address, and that view ends where the
+/// copy ends: at the end of the title buffer, or of the 4 MiB window of
+/// memory outside buffers. The builder's structures lie in plain title
+/// memory at any address and are megabytes long: one that crosses a
+/// window's end was read as zeros and its stores were dropped from there
+/// on, the stages after it computed their offsets from those zeros and
+/// stored over whatever else lay in the window (the title died within a
+/// second of the first build, on pointers that had become bounding boxes:
+/// +inf, -inf). By address every access finds the copy of its own 64 KiB
+/// page.
+fn roots_by_address() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_BY_ADDRESS").is_none_or(|v| v != "0"))
+}
 
 /// The host GPU's `WaveLaneCountMax`: 32 lets console wave64 compute programs whose cross-lane
 /// code stays inside 32-lane halves run in waves of 32 instead of being refused.
@@ -1280,6 +1352,7 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
+        let mut buffer_meet: Option<Vec<bool>> = None;
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_meetings`)
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
@@ -1414,6 +1487,9 @@ impl<'a> Lower<'a> {
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
+            if wave == 32 && x.native.wave64 && group > 32 && buffers_meet(x.native) {
+                buffer_meet = all_lane_blocks(x.st);
+            }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
@@ -1546,6 +1622,7 @@ impl<'a> Lower<'a> {
                 m
             },
             handles: HashMap::new(),
+            by_address: None,
             strides: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -1554,6 +1631,8 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            buffer_meet,
+            buffer_read: true,
             split_lds,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
@@ -2239,6 +2318,29 @@ impl<'a> Lower<'a> {
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
+        if crate::structure::entry_limited()
+            && let StageIo::Cs(cs) = &self.x.native.io
+            && let Some(&(_, lo)) = p.inputs.iter().find(|i| i.0 == Reg::S(EXEC))
+        {
+            // EXEC on entry, a lane's own bit: its thread along x is below the count the
+            // dispatch runs (`shader.rs` `USER_THREAD_LIMIT`).
+            use super::shader::USER_THREAD_LIMIT;
+            let (e, i32t) = (self.s.entry, self.s.t.i32);
+            let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+                unreachable!()
+            };
+            let thread = match self.thread_id(0) {
+                Val::I32(t) => t,
+                _ => return Err(unsupported(0, "a thread id for the dispatch's thread count")),
+            };
+            let size = self.s.m.i32(cs.threads[0]);
+            let first = self.s.m.bin(e, Bin::Mul, group, size);
+            let at = self.s.m.bin(e, Bin::Add, first, thread);
+            let limit = self.host_word(RootType::Other(USER_THREAD_LIMIT), 0, 0);
+            let _ = i32t;
+            let bit = self.s.m.cmp(e, pred::IULT, at, limit);
+            self.lane_bits.insert(lo, bit);
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -4815,6 +4917,26 @@ impl<'a> Lower<'a> {
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
+        if let Some(all) = &self.buffer_meet {
+            // Memory a wave reads and then writes in place (`buffers_meet`).
+            if i == 0 {
+                // (what ran before the block is not followed: a read may have)
+                self.buffer_read = true;
+            }
+            let memory = matches!(inst.fields, Fields::Buffer { .. })
+                || matches!(inst.fields, Fields::Flat { .. }) && name.starts_with("global_");
+            let writes = memory && (name.contains("store") || name.contains("atomic"));
+            if writes && self.buffer_read && all.get(b).copied().unwrap_or(false) {
+                // the two host waves of a console wave meet before the store: what the other
+                // half still reads of the buffer is not overwritten under it
+                let mode = self.s.m.i32(meeting_mode() | 2);
+                let void = self.s.t.void;
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.buffer_read = false;
+            } else if memory && !writes {
+                self.buffer_read = true;
+            }
+        }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -6332,6 +6454,11 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        if let Some(h) = self.by_address
+            && !sampler
+        {
+            return Ok(h);
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);
@@ -10275,6 +10402,50 @@ impl<'a> Lower<'a> {
     }
 
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let done = self.buffer_access(inst, b, i);
+        self.by_address = None;
+        done
+    }
+
+    /// For a buffer descriptor built around a root view that is reached by
+    /// address ([`roots_by_address`]): the view's title address as the
+    /// host tells it (`shader.rs` `USER_ROOT_ADDRESS`), and the byte offset
+    /// the descriptor adds (constant and computed parts).
+    #[allow(clippy::type_complexity)]
+    fn root_by_address(&mut self, src: &Source) -> Result<Option<((V, V), u32, Option<V>)>, Why> {
+        use super::shader::USER_ROOT_ADDRESS;
+        let Source::Built { address, .. } = src else {
+            return Ok(None);
+        };
+        if !roots_by_address() || !crate::spill::is_spilled(self.x.native) {
+            return Ok(None);
+        }
+        let Some(rp) = self.x.native.layout.get(address.param).copied() else {
+            return Ok(None);
+        };
+        if rp.root != RootType::Descriptor {
+            return Ok(None);
+        }
+        let kind = self
+            .x
+            .native
+            .used
+            .iter()
+            .find(|u| u.user_data == rp.user_data)
+            .map(|u| u.kind);
+        if !matches!(kind, Some(ResourceType::Uav | ResourceType::Srv)) {
+            return Ok(None);
+        }
+        let lo = self.host_word(RootType::Other(USER_ROOT_ADDRESS), rp.slot, 0);
+        let hi = self.host_word(RootType::Other(USER_ROOT_ADDRESS + 1), rp.slot, 0);
+        let x = match address.dynamic {
+            Some(v) => Some(self.i32_of(v)?),
+            None => None,
+        };
+        Ok(Some(((lo, hi), address.offset, x)))
+    }
+
+    fn buffer_access(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
             data,
             addr,
@@ -10374,7 +10545,12 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
-        let (base, extra) = self.built_offset(src)?;
+        let rooted = self.root_by_address(src)?;
+        let (base, extra) = match rooted {
+            // (no bias: the address is the title's own)
+            Some((_, base, extra)) => (base, extra),
+            None => self.built_offset(src)?,
+        };
         if base != 0 {
             let b = self.s.m.i32(base);
             off = self.s.m.bin(c, Bin::Add, off, b);
@@ -10411,6 +10587,28 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Mul, element, k);
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
+        }
+        if let Some(((lo, hi), ..)) = rooted {
+            // By address: the byte in the root view becomes the byte in
+            // the host copy that holds its page.
+            // (a load in a format is a raw load taken apart: `format_load`)
+            if typed && format.is_none() {
+                return Err("a typed access through a root view reached by address");
+            }
+            if let Some(element) = index.take() {
+                if used.is_none_or(|u| u.stride != 1) {
+                    return Err("an indexed access through a root view reached by address");
+                }
+                off = self.s.m.bin(c, Bin::Add, element, off);
+            }
+            let i32t = self.s.t.i32;
+            let sum = self.s.m.bin(c, Bin::Add, lo, off);
+            let wrapped = self.s.m.cmp(c, pred::IULT, sum, lo);
+            let one = self.s.m.cast(c, Cast::ZExt, wrapped, i32t);
+            let hi = self.s.m.bin(c, Bin::Add, hi, one);
+            let (h, byte) = self.memory(sum, hi, guard);
+            self.by_address = Some(h);
+            off = byte;
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).

@@ -69,6 +69,19 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: the low
+/// 32 bits of the title address of the root view of root parameter `slot`;
+/// [`USER_ROOT_ADDRESS`] + 1: its bits from 32 up. For programs that reach
+/// a root view's memory by address ([`SLOT_MEMORY`]) and not through a
+/// view the host binds: a host view ends where its host copy ends, a
+/// console root view has no end.
+pub const USER_ROOT_ADDRESS: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: the number of threads the
+/// dispatch runs along x, for a dispatch by thread counts (the console's `DispatchX` with
+/// the "use thread dimensions" bit); `u32::MAX` for a dispatch by groups. A lane whose thread
+/// (group x group size + thread in group) is not below it starts outside EXEC
+/// (`structure::set_entry_limited`).
+pub const USER_THREAD_LIMIT: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

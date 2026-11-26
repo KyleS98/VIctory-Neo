@@ -479,6 +479,8 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     if bytes.is_empty() || at / K64 != (at + bytes.len() - 1) / K64 {
         return None;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::bvhtrace::wrote(at, bytes.as_ptr(), bytes.len());
     // No mapping changes until the bytes are in: the view found below
     // shows these pages for as long as this is held.
     let _still = crate::watch::title_memory_reading_now()?;
@@ -547,6 +549,22 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     // caller's slice.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (view.base + offset as usize) as *mut u8, bytes.len()) };
     Some(shown)
+}
+
+/// The 64 KiB pages of title views that show the section page title
+/// address `at` shows (its own among them); none outside view memory.
+/// Diagnostics: where else a write to `at` appears.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn shown_at(at: usize) -> Vec<usize> {
+    let v = views();
+    let Some((&base, &(len, section, offset))) = v.views.range(..=at).next_back() else {
+        return Vec::new();
+    };
+    if at >= base + len {
+        return Vec::new();
+    }
+    let offset = offset + (at - base) as u64;
+    v.pages.get(&(section, offset - offset % K64 as u64)).cloned().unwrap_or_default()
 }
 
 /// How the views cover `[at, at + len)`.

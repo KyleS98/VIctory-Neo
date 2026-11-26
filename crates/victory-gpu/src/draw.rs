@@ -346,6 +346,8 @@ pub(crate) fn window_line(frames: f64) {
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
+    /// See [`State::set_thread_limit`].
+    thread_limit: Option<u32>,
     /// View heap, sampler heap.
     heaps: [usize; 2],
     graphics: Vec<Root>,
@@ -941,9 +943,28 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == victory_shader::emit::USER_THREAD_LIMIT {
+            return self.thread_limit.unwrap_or(u32::MAX);
+        }
+        if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
+            // The title address of the root view itself: the shader reaches
+            // its memory by address.
+            // (memory past the directory's reach by its stand-in pages)
+            return match self.roots_ref(compute).get(usize::from(slot)).map(|r| match r {
+                Root::View(address) => Some(crate::memory::far_address(*address)),
+                _ => None,
+            }) {
+                Some(Some(address)) if kind == USER_ROOT_ADDRESS => address as u32,
+                Some(Some(address)) => (address >> 32) as u32,
+                _ => {
+                    once!(slot, "a shader reaches a root view the title did not set by address: it reads 0");
+                    0
+                }
+            };
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -982,15 +1003,19 @@ impl State {
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool, used: &[u8]) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
         let (mut addresses, mut constants) = (Vec::new(), Vec::new());
-        for root in self.roots_ref(compute) {
+        for (slot, root) in self.roots_ref(compute).iter().enumerate() {
             match root {
-                Root::View(address) => addresses.push(*address),
+                // Only the views the program reads: a list keeps the root
+                // views of the pipelines before this one in its other
+                // slots (the builder's stages left some 250 windows of
+                // its library's own memory named that way).
+                Root::View(address) if used.contains(&(slot as u8)) => addresses.push(*address),
                 Root::Constants(values) => constants.extend_from_slice(values),
                 _ => {}
             }
@@ -1178,7 +1203,19 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                // The root views it reads: by address, or bound.
+                let used: Vec<u8> = t
+                    .host
+                    .user_data
+                    .iter()
+                    .filter(|u| {
+                        matches!(u.root, RootType::Other(k) if k == victory_shader::emit::USER_ROOT_ADDRESS || k == victory_shader::emit::USER_ROOT_ADDRESS + 1)
+                    })
+                    .map(|u| u.slot)
+                    .chain(t.host.root_srvs.iter().copied())
+                    .chain(t.host.root_uavs.iter().copied())
+                    .collect();
+                let Some(ready) = self.memory_ready(list, compute, writes, &used) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -2170,7 +2207,39 @@ impl State {
     /// ray-tracing structure builder passes its buffers this way).
     #[cfg(feature = "diagnostics")]
     fn list_dropped_roots(&self, groups: [u32; 3]) {
-        crate::capture::op(0, || {
+        crate::capture::op(0, || self.roots_text(groups));
+    }
+
+    /// For the builder's trace: the first 64 bytes of title memory at each
+    /// compute root view, as the title has them when the dispatch is
+    /// recorded (the builder's programs compute store offsets from the
+    /// headers of the structures they are given).
+    #[cfg(feature = "diagnostics")]
+    fn root_heads(&self) -> String {
+        use std::fmt::Write;
+        let mut text = String::new();
+        let mut seen = Vec::new();
+        for (slot, root) in self.compute.iter().enumerate() {
+            let Root::View(a) = root else { continue };
+            if seen.contains(a) || *a >= 0x20_0000_0000 {
+                continue;
+            }
+            seen.push(*a);
+            let mut bytes = [0u8; 64];
+            if crate::host::read_into(*a as *const u8, &mut bytes) {
+                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                let _ = write!(text, " head{slot}@{a:#x}={hex}");
+            } else {
+                let _ = write!(text, " head{slot}@{a:#x}=unreadable");
+            }
+        }
+        text
+    }
+
+    /// [`State::list_dropped_roots`]'s text.
+    #[cfg(feature = "diagnostics")]
+    fn roots_text(&self, groups: [u32; 3]) -> String {
+        {
             use std::fmt::Write;
             let [x, y, z] = groups;
             let mut text = format!("  its roots ({x}x{y}x{z}):");
@@ -2195,7 +2264,7 @@ impl State {
                 }
             }
             text
-        });
+        }
     }
 
     /// Whether the shaders of the pipeline bound now can store to buffers
@@ -2205,6 +2274,17 @@ impl State {
     /// a window ([`windows`]).
     fn may_store(&self) -> bool {
         crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+    }
+
+    /// The title's pipeline bound now (0: none).
+    pub(crate) fn pipeline_now(&self) -> usize {
+        self.pipeline
+    }
+
+    /// The threads the next dispatch runs along x, for a dispatch by thread counts
+    /// (`victory_shader::emit::USER_THREAD_LIMIT`); none: every thread of its groups.
+    pub(crate) fn set_thread_limit(&mut self, threads: Option<u32>) {
+        self.thread_limit = threads;
     }
 
     /// Runs a dispatch on the host.
@@ -2261,10 +2341,32 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            crate::bvhtrace::dispatch(|| format!("{}	{}	{}", p.name, self.roots_text([x, y, z]), self.root_heads()));
+        }
+        #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        // A stage of the structure builder reads what the stage before it
+        // stored, through views and addresses of plain title memory that no
+        // barrier of the title's names: the host may run two dispatches at
+        // once unless told that the first one's stores come first
+        // (`VICTORY_BVH_ORDERED=0`: not told, as before).
+        if crate::pipeline::is_builder(self.pipeline as This) && builder_ordered() {
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            };
+            // SAFETY: an open list; a barrier on no resource in particular.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -3385,6 +3487,10 @@ impl State {
             return false;
         }
         #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            crate::bvhtrace::dispatch(|| format!("{}	INDIRECT kind {kind} at {arguments:#x} {}", p.name, self.roots_text([0, 0, 0])));
+        }
+        #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
@@ -3795,4 +3901,13 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
     }
+}
+
+/// Whether every dispatch of the ray-tracing structure builder is followed
+/// by an unordered-access barrier on every resource
+/// (`VICTORY_BVH_ORDERED=0`: none, as before).
+#[cfg(windows)]
+fn builder_ordered() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_ORDERED").is_none_or(|v| v != "0"))
 }

@@ -2970,6 +2970,16 @@ impl Shadow {
                 let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
                     continue;
                 };
+                // For the builder's trace: what the snapshot held where the
+                // first run of the card's bytes goes (the title's bytes too:
+                // a byte is written only where the title left it).
+                #[cfg(feature = "diagnostics")]
+                if let Some(&(off, len)) = runs.first() {
+                    crate::bvhtrace::note(|| {
+                        let was: String = old[first + off..].iter().take(24).map(|b| format!("{b:02x}")).collect();
+                        format!("was	{:#x}	{len:#x}	{was}	runs {}", start + at + first + off, runs.len())
+                    });
+                }
                 let at = at + first;
                 crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
                 crate::watch::writing(start + at, n);
