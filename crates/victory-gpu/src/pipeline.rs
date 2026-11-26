@@ -672,7 +672,7 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -692,7 +692,11 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+/// The shader of `p` that `VICTORY_SKIP_PIPELINES` names, if one: its draws
+/// and dispatches are left out. In every build since the list is what keeps
+/// the ray-tracing resolve passes off a card that cannot build the
+/// structures they read (it was a diagnostics switch only).
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     // A set: with the 1,034 ray-tracing shaders listed, a list cost about 20 million string compares a
     // frame on the recording threads (fxceless/victory-fork#1379).
@@ -710,7 +714,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
