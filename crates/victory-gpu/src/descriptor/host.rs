@@ -510,6 +510,31 @@ fn tabled_out() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
 }
 
+/// Whether every slot of a table a draw binds counts as a table's slot,
+/// not only those that hold texture views (`VICTORY_TABLED_ALL=1`; off by
+/// default).
+///
+/// The title writes its per-draw tables into its heap as bytes, every
+/// frame. A table that holds a constant buffer is made afresh for its draw
+/// in slots of our own, so the title's slots of it are read by nothing
+/// unless a shader picks them by index. The pass over records copied in as
+/// bytes (`super::sync_heaps`) cannot know that, and took every changed
+/// record there that was not a texture's for one a shader may pick: in the
+/// prologue's cell 11,400 buffer views a frame "left for later" by it
+/// (3.7 thousand more made null), each then made and its memory looked at
+/// by the once-a-frame pass over buffer views picked by index
+/// (`State::heap_buffers`, 28 ms a frame of a recording thread), and
+/// 13 ms a frame of the submitting thread for the pass itself.
+///
+/// With the switch such a slot is left to its draws for as long as a
+/// table's texture slot is ([`TABLED_FRAMES`]). What it risks is what that
+/// rule risks for textures: a slot that was a table's and is then picked
+/// by index only is not noticed until the frames are over.
+pub(crate) fn tabled_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_ALL").is_some_and(|v| v == "1"))
+}
+
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
@@ -1476,6 +1501,15 @@ impl HostHeap {
         self.tabled_in(index, read, crate::frame::current());
     }
 
+    /// Title slot `index` is one of a table a draw binds, whatever it
+    /// holds (with [`tabled_all`]): the pass over records copied in as
+    /// bytes leaves it to its draws, as it leaves a table's texture slots.
+    pub(crate) fn table_slot(&self, index: u32) {
+        if tabled_all() {
+            self.tabled_in(index, false, crate::frame::current());
+        }
+    }
+
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
     fn tabled_in(&self, index: u32, read: bool, frame: u64) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -2004,12 +2038,19 @@ impl HostHeap {
                 self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
+                mirrored(for_draw, 0);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
                 let _ = self.note_buffer(index, None, false);
+                mirrored(for_draw, 1);
+            } else {
+                mirrored(for_draw, 1);
             }
             return None;
         };
+        if made[index as usize] == key {
+            mirrored(for_draw, 2);
+        }
         if made[index as usize] != key {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
@@ -2041,8 +2082,10 @@ impl HostHeap {
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                mirrored(for_draw, 3);
                 return Some(view);
             }
+            mirrored(for_draw, if !later { 6 } else if view.is_buffer() { 4 } else { 5 });
             let next_key = if later { 0 } else { key };
             made[index as usize] = next_key;
             let kept = if later {
@@ -2313,6 +2356,19 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame line: what [`HostHeap::mirror`] did past its
+/// lock-free answer, for the passes (places 0 to 6) and for draws (7 to
+/// 13): a slot that showed something made null (its record is no view now),
+/// a record that is no view over a slot that showed nothing, a slot that
+/// was up to date after all, a slot left showing its placed texture's old
+/// view, a buffer view left for its draw or pass, a texture view left
+/// waiting for its host copy, a slot made.
+pub(crate) static MIRRORED: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+
+fn mirrored(for_draw: bool, what: usize) {
+    MIRRORED[what + if for_draw { 7 } else { 0 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same

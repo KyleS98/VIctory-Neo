@@ -277,6 +277,14 @@ pub(crate) fn sync_line(frames: f64) {
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
+    let m: Vec<f64> = host::MIRRORED.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "host slots brought up to date past the lock-free answer, per frame: by the passes {:.0} made null, \
+         {:.0} no view over nothing, {:.0} up to date after all, {:.0} kept on an old view, {:.0} buffer views left \
+         for later, {:.0} textures left waiting, {:.0} made; by draws {:.0} made null, {:.0} no view over nothing, \
+         {:.0} up to date after all, {:.0} kept, {:.0} buffers left, {:.0} waiting, {:.0} made",
+        m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13]
+    );
 }
 
 /// Whether [`sync_heaps`] hands a changed page's records to the host heap
