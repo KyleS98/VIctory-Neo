@@ -2800,6 +2800,63 @@ fn flying() -> bool {
     line.settling || line.line.iter().any(|l| matches!(l, Late::Run(_)))
 }
 
+/// Since the last frame line, of the submissions that waited for flights
+/// because they read title memory those may write: how many; their lists;
+/// the lists before the first one with a step that waits; the steps of
+/// that list before that step; and the microseconds from the wait's end
+/// to the submission's going to the card (its preparing, for which the
+/// card has nothing to run).
+static BLOCKED_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The list of `runs` with the first step that waits for the flights
+/// writing `written`, and that step's place in it.
+fn first_blocked(written: &[(usize, usize)], runs: &[&HostList]) -> Option<(usize, usize)> {
+    runs.iter().enumerate().find_map(|(at, list)| {
+        let steps = list.deferred().copies.len();
+        (0..steps).find(|&n| list.step_blocks(written, n)).map(|n| (at, n))
+    })
+}
+
+/// Whether a step of `readers` reads, on the CPU when its list is
+/// submitted, title memory that shaders of `writers` may write: a title
+/// buffer copy from or into a range they declared written, a fill of
+/// upload memory from one, a texture's memory in one. Such lists cannot go
+/// to the card in one submission with `writers` ahead of them: prepared
+/// together, the step would read what the memory held before those
+/// shaders ran (`crate::queue`: parts joined).
+pub(crate) fn reads_written_by(writers: &[&HostList], readers: &[&HostList]) -> bool {
+    let mut declared: Vec<(usize, usize)> = Vec::new();
+    for list in writers {
+        let ranges: Vec<(usize, usize)> = list
+            .deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                Step::GpuWrite(_, address, len) => Some((*address, *address + *len)),
+                _ => None,
+            })
+            .collect();
+        join_ranges(&mut declared, ranges);
+        // And the title memory the list's texture read-backs land in.
+        let backs: Vec<(usize, usize)> = list.deferred().texture_backs.iter().map(crate::texback::Back::range).collect();
+        join_ranges(&mut declared, backs);
+    }
+    if declared.is_empty() {
+        return false;
+    }
+    readers.iter().any(|list| {
+        list.deferred().copies.iter().any(|step| match step {
+            &Step::Copy(dst, src, len) => touches(&declared, src, src + len) || touches(&declared, dst, dst + len),
+            &Step::Fill(_, src, len) => touches(&declared, src, src + len),
+            Step::Texture(staging) => {
+                let (at, len) = staging.memory();
+                touches(&declared, at, at + len)
+            }
+            _ => false,
+        })
+    })
+}
+
 /// With flights in the air ([`late`]): why `runs` cannot be prepared
 /// before they are settled, if so. Preparing reads title memory on the
 /// CPU (the title's buffer copies, fills of upload memory, textures) and
@@ -3736,6 +3793,20 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     fill_check::line();
     fill_ahead::line(frames);
+    let b = [0, 1, 2, 3, 4].map(|i| BLOCKED_STATS[i].swap(0, Ordering::Relaxed) as f64);
+    if b[0] > 0.0 {
+        tracing::info!(
+            "submissions that waited for flights whose memory they read: {:.1} per frame, of {:.1} lists each; the first step that \
+             waits is in list {:.1} of them on average, step {:.0} of it; from the wait's end to the card {:.2} ms each ({:.1} ms a frame \
+             with nothing for the card to run)",
+            b[0] / frames,
+            b[1] / b[0],
+            b[2] / b[0],
+            b[3] / b[0],
+            b[4] / b[0] / 1000.0,
+            b[4] / frames / 1000.0
+        );
+    }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -5914,6 +5985,8 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        // When a wait for flights this submission reads ended, if it waited.
+        let mut waited_until: Option<std::time::Instant> = None;
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -5921,9 +5994,17 @@ impl Host {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
             if relay_exact() && why == WHY_READ {
+                let written = line().written.clone();
+                if let Some((list, step)) = first_blocked(&written, runs) {
+                    BLOCKED_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    BLOCKED_STATS[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                    BLOCKED_STATS[2].fetch_add(list as u64, Ordering::Relaxed);
+                    BLOCKED_STATS[3].fetch_add(step as u64, Ordering::Relaxed);
+                }
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                waited_until = Some(std::time::Instant::now());
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -6042,6 +6123,9 @@ impl Host {
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
+            if let Some(since) = waited_until {
+                BLOCKED_STATS[4].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
@@ -7697,6 +7781,24 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
+    /// Whether step `place` of the list waits for the flights writing
+    /// `written` ([`blocked_by`]'s test for one step, counting nothing).
+    fn step_blocks(&self, written: &[(usize, usize)], place: usize) -> bool {
+        match self.deferred().copies.get(place) {
+            Some(&Step::Copy(dst, src, len)) => {
+                (touches(written, src, src + len) || touches(written, dst, dst + len))
+                    && !(!touches(written, dst, dst + len) && fill_ahead::on())
+            }
+            Some(&Step::Fill(_, src, len)) => touches(written, src, src + len) && !fill_ahead::on(),
+            Some(Step::Texture(staging)) => {
+                let (at, len) = staging.memory();
+                touches(written, at, at + len)
+            }
+            Some(Step::Run(_)) => true,
+            _ => false,
+        }
+    }
+
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};

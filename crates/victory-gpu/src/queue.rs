@@ -658,6 +658,14 @@ impl Joined {
         self.parts >= join_most() || self.order.len() >= join_lists()
     }
 
+    /// Whether the part `lists` (run in `order`) reads on the CPU what the
+    /// parts taken write with their shaders (`crate::host::reads_written_by`).
+    fn written_for(&self, lists: &[crate::list::Detached], order: &[usize]) -> bool {
+        let writers: Vec<&crate::host::HostList> = self.order.iter().map(|&i| self.lists[i].host()).collect();
+        let readers: Vec<&crate::host::HostList> = order.iter().map(|&i| lists[i].host()).collect();
+        crate::host::reads_written_by(&writers, &readers)
+    }
+
     /// Whether a bottom-of-pipe write of a part taken meets `wait`.
     fn meets(&self, wait: &crate::list::ValueWait) -> bool {
         let (address, bytes) = wait.place();
@@ -674,6 +682,30 @@ fn join<T>(mut lists: Vec<T>, mut order: Vec<usize>, more: Vec<T>, more_order: V
     order.extend(more_order.into_iter().map(|i| i + base));
     (lists, order)
 }
+
+/// Whether a part that reads on the CPU what the parts taken before it
+/// write with their shaders is left out of their submission
+/// (`VICTORY_JOIN_READS=1`; off by default).
+///
+/// Parts the title submitted one after the other are prepared together
+/// when they are joined: every title buffer copy and every fill of upload
+/// memory of the later part reads title memory before the earlier part's
+/// shaders have run, where apart it would have waited for them (the
+/// earlier part's flight declares the memory). In the prologue's cell the
+/// print on the back of the shirt is missing with parts joined and there
+/// with `VICTORY_JOIN_MOST=1` (runs v8iS3 and v8fS1, Series S profile).
+///
+/// With the switch such a part starts a submission of its own: the parts
+/// taken go first, and it waits for them as it would have unjoined.
+#[cfg(windows)]
+fn join_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_READS").is_some_and(|v| v == "1"))
+}
+
+/// Since the start: parts left out of a joined submission by [`join_reads`].
+#[cfg(windows)]
+pub(crate) static JOIN_READS: AtomicU64 = AtomicU64::new(0);
 
 /// Parts joined, host submissions they went in, their lists, signals
 /// delivered behind them, and waits passed for a write of a part taken.
@@ -838,6 +870,20 @@ fn release_held_now(all: bool) {
                             if !joined.marked.contains(&q) {
                                 held.insert(0, Held::Running);
                                 joined.marked.push(q);
+                            }
+                            // A part that reads, on the CPU, memory the
+                            // parts taken write with their shaders goes in
+                            // a submission of its own behind them
+                            // (`join_reads`).
+                            if join_reads() && !joined.is_empty() && joined.written_for(&lists, &order) {
+                                JOIN_READS.fetch_add(1, Ordering::Relaxed);
+                                drop(held);
+                                send_joined(&mut joined);
+                                held = lock(line);
+                                if !joined.marked.contains(&q) {
+                                    held.insert(0, Held::Running);
+                                    joined.marked.push(q);
+                                }
                             }
                             joined.add(lists, order);
                             if joined.full() {
