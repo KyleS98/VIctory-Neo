@@ -4452,7 +4452,7 @@ impl Host {
         // flights' own declared writes (`declared_writes`).
         if crate::census::skip_wc_compare() {
             let before = declared.len();
-            declared.retain(|(_, ranges)| !crate::census::all_wc(ranges));
+            declared.retain(|(shadow, ranges)| !(crate::census::skip_wc_big(shadow.span().1) && crate::census::all_wc(ranges)));
             crate::census::UNCOMPARED.fetch_add((before - declared.len()) as u64, Ordering::Relaxed);
         }
         // With the relay: the order of the queue is held from here until
@@ -5017,7 +5017,7 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi
-                            && !crate::census::skip_back(r.declared, (hi - lo) as u64)
+                            && !crate::census::skip_back(r.declared, (hi - lo) as u64, r.shadow.span().1)
                             && seen.insert((copy, lo, hi))
                         {
                             pieces.push((r.shadow.clone(), lo, hi, total));
@@ -5481,7 +5481,7 @@ impl Host {
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if lo < hi
-                    && !crate::census::skip_back(r.declared, (hi - lo) as u64)
+                    && !crate::census::skip_back(r.declared, (hi - lo) as u64, r.shadow.span().1)
                     && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
                 {
                     pieces.push((i, lo, hi, total));

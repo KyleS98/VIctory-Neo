@@ -115,10 +115,24 @@ pub(crate) static UNCOMPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub(crate) static SKIPPED: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// `VICTORY_SKIP_WC_MIN_KB` (default 1024): [`skip_wc_back`] and
+/// [`skip_wc_compare`] leave a copy alone unless it is at least this many
+/// KiB. The small write-combining buffers hold the counts and visibility
+/// lists the title's CPU does read: skipping them gave black frames and
+/// lost draws once small buffers have card copies
+/// (`VICTORY_CARD_BUFFERS_MIN_KB=64`; fxceless/victory-fork#1268, #1379).
+pub(crate) fn skip_wc_big(copy_bytes: u64) -> bool {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let min = *MIN.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_WC_MIN_KB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1024) << 10
+    });
+    copy_bytes >= min
+}
+
 /// A flagged piece is clipped to its declaration. Keep every piece of a
 /// mixed declaration so the normal read-back covers it in full.
-pub(crate) fn skip_back(declared: (usize, usize), bytes: u64) -> bool {
-    if !skip_wc_back() {
+pub(crate) fn skip_back(declared: (usize, usize), bytes: u64, copy_bytes: u64) -> bool {
+    if !skip_wc_back() || !skip_wc_big(copy_bytes) {
         return false;
     }
     let wc = all_wc(&[declared]);
