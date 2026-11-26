@@ -83,7 +83,22 @@ static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// where a fault and its handler cost tens (run 230: 1,000 to 1,300 faults
 /// a frame, nearly all of them such askings, took back most of what the
 /// copies in place had won).
-const LEAST: usize = 256;
+///
+/// 16 since run v8dS2 (was 256): the askings are of 8 bytes at most, and
+/// between the two sizes lay 3,400 real copies a frame (descriptor records,
+/// small constant blocks) that each took a system call, 3.2 ms a frame of
+/// the submitting thread in `ZwReadVirtualMemory`. With 16, 462 copies a
+/// frame stay with the kernel, 4 a frame meet a page that is not there
+/// (2 with 256), and the frame's preparing fell from about 32.5 to 31 ms.
+const LEAST: usize = 16;
+
+/// [`LEAST`], or what `VICTORY_COPY_PLAIN_LEAST` says (bytes; 256: as
+/// before. Blocks a copy faulted in lately go to the kernel's copy whatever
+/// their size, [`RECENT`]).
+fn least() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_COPY_PLAIN_LEAST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(LEAST))
+}
 
 /// The 64 KiB blocks of title memory a copy in place faulted in lately:
 /// their copies go straight to the kernel's, which reads round the hole.
@@ -188,7 +203,7 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     if !on() {
         return false;
     }
-    if len < LEAST {
+    if len < least() {
         COUNT[4].fetch_add(1, Relaxed);
         return false;
     }
@@ -216,8 +231,9 @@ pub(crate) fn line(frames: f64) {
     tracing::info!(
         "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
-         faulted in the last two seconds, {small:.0} of under {LEAST} bytes",
-        bytes / 1e6
+         faulted in the last two seconds, {small:.0} of under {} bytes",
+        bytes / 1e6,
+        least()
     );
 }
 
