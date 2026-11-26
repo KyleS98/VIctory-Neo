@@ -455,7 +455,6 @@ impl Structured {
     }
 }
 
-/// Builds the per-lane form of `program`.
 thread_local! {
     static ENTRY_LIMITED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -476,6 +475,7 @@ pub fn set_entry_limited(on: bool) {
     ENTRY_LIMITED.set(on);
 }
 
+/// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     structure_wide(program, &HashSet::new())
 }
