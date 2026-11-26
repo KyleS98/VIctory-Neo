@@ -1,4 +1,4 @@
-//! Optional half-resolution rendering for the known 1.0.2.1 title image.
+//! Optional reduced-resolution rendering for the known 1.0.2.1 title image.
 //! Placement and signatures follow VIctory-NVIDIA 033be27 and its
 //! victory-perf/ScarlettPort sources. This hook only adjusts render scale.
 
@@ -14,9 +14,9 @@ struct Patch {
     after: Vec<u8>,
 }
 
-/// The shipped FSR path requires 720p on Series S. The half-scale
-/// option selects the existing built-in upscaler and fixes its range.
-fn half_resolution() -> [Patch; 3] {
+/// The shipped FSR path requires 720p on Series S. Reduced resolution
+/// selects the existing built-in upscaler with a fixed render scale.
+fn reduced_resolution(scale: f32) -> [Patch; 3] {
     [
         Patch {
             offset: 0x7e9426,
@@ -26,7 +26,7 @@ fn half_resolution() -> [Patch; 3] {
         Patch {
             offset: 0x28f1e7e,
             before: (2.0f32 / 3.0).to_le_bytes().to_vec(),
-            after: 0.5f32.to_le_bytes().to_vec(),
+            after: scale.to_le_bytes().to_vec(),
         },
         Patch {
             offset: 0x28f1e87,
@@ -46,17 +46,17 @@ pub(crate) unsafe fn apply(base: usize, size: usize, hash: &blake3::Hash) -> Res
     let Ok(scale) = std::env::var("VICTORY_RENDER_SCALE") else {
         return Ok(());
     };
-    if scale.trim().parse::<f32>().ok() != Some(0.5) {
-        tracing::warn!("VICTORY_RENDER_SCALE supports 0.5 for this experiment");
+    let Some(scale @ (0.4 | 0.5)) = scale.trim().parse::<f32>().ok() else {
+        tracing::warn!("VICTORY_RENDER_SCALE supports 0.4 and 0.5");
         return Ok(());
-    }
+    };
     if !hash.to_hex().starts_with(BUILD) {
         tracing::warn!("render scale skipped for an unsupported title build");
         return Ok(());
     }
     // SAFETY: the caller guarantees that the identified image is fully loaded.
-    if unsafe { apply_patches(base, size, &half_resolution()) }? {
-        tracing::info!("title built-in upscaler selected at render scale 0.5");
+    if unsafe { apply_patches(base, size, &reduced_resolution(scale)) }? {
+        tracing::info!(scale, "title built-in upscaler selected");
     }
     Ok(())
 }
@@ -139,8 +139,17 @@ mod tests {
     };
 
     #[test]
+    fn forty_percent_scale_keeps_the_built_in_upscaler() {
+        let half = reduced_resolution(0.5);
+        let reduced = reduced_resolution(0.4);
+        assert_eq!(reduced[0].after, half[0].after);
+        assert_eq!(reduced[1].after, 0.4f32.to_le_bytes());
+        assert_eq!(reduced[2].after, half[2].after);
+    }
+
+    #[test]
     fn half_scale_selects_the_built_in_upscaler() {
-        let patches = half_resolution();
+        let patches = reduced_resolution(0.5);
         assert_eq!(patches[0].after, [0x0f, 0x1f, 0x00]);
         assert_eq!(patches[1].after, 0.5f32.to_le_bytes());
         assert!(
