@@ -2950,7 +2950,31 @@ mod fill_ahead {
 
     pub(super) fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && (never() || !WAIT.load(Relaxed))
+    }
+
+    /// `VICTORY_FILL_WAIT=never`: fills (and the title's buffer copies that
+    /// only read such memory) go on reading ahead of flights after one was
+    /// found to have read bytes a flight then changed (it is still said,
+    /// once). FOR MEASURING ONLY: the picture is wrong with it.
+    ///
+    /// In the prologue's cell the one block that turns the waiting back on
+    /// is 2 KiB of constants at a fixed place that shaders rewrite within
+    /// the frame: the title binds it as a constant buffer and copies it
+    /// into a ring, twice a frame. Waiting for it is where our thread and
+    /// the card meet, twice a frame: 15 ms a frame of the submitting thread
+    /// standing still once the rest was faster (run v8fS1), as
+    /// fxceless/victory-fork#1256 found on another card.
+    ///
+    /// Run v8hS1 (RTX 3090 Ti, Series S profile): with `never` the frame
+    /// fell from 53.3 to 45.5 ms and the card went from 70 to 82 % busy,
+    /// which is what a fix that keeps those bytes on the card could gain;
+    /// and a dark, stepped smear lay on the cell's left wall in every
+    /// frame (compare fxceless/victory-fork#1223), because the copies took
+    /// the block as an earlier pass had left it.
+    pub(super) fn never() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_some_and(|v| v == "never"))
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
