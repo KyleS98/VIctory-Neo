@@ -694,10 +694,12 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    // A set: with the 1,034 ray-tracing shaders listed, a list cost about 20 million string compares a
+    // frame on the recording threads (fxceless/victory-fork#1379).
+    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        parse_skip_hashes(&value).into_iter().collect()
     });
     if hashes.is_empty() {
         return None;
