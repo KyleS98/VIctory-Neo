@@ -154,6 +154,13 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    // The write watch's guards keep what they know of unmapped blocks in a
+    // placeholder (`VICTORY_ABSENT_ONCE`); anything else reserved or
+    // committed there ends that.
+    #[cfg(windows)]
+    if !at.is_null() {
+        victory_gpu::title_memory_placeholder(at as usize, size, placeholder);
+    }
     if base.is_null() {
         // The census keeps what the title asked for (`VICTORY_CENSUS`).
         #[cfg(windows)]

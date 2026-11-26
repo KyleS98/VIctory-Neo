@@ -585,6 +585,68 @@ struct Guards {
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
     viewed: BTreeSet<usize>,
+    /// The runtime's placeholder reservations ([`title_memory_placeholder`]):
+    /// first block to the block past the last. Nothing but the runtime's
+    /// own mapping of physical pages makes memory appear in one, and it
+    /// says so every time ([`title_memory_remapped`]).
+    placeholders: BTreeMap<usize, usize>,
+}
+
+impl Guards {
+    /// The block past the placeholder reservation `block` lies in, if it
+    /// lies in one.
+    fn placeholder_end(&self, block: usize) -> Option<usize> {
+        self.placeholders.range(..=block).next_back().map(|(_, &end)| end).filter(|&end| block < end)
+    }
+}
+
+/// Whether a block noted absent inside a placeholder reservation stays so
+/// without a question to Windows until the runtime maps it
+/// (`VICTORY_ABSENT_ONCE=0`: asked at every asking, as before).
+///
+/// Every asking about a range with unmapped blocks asked Windows once per
+/// run of them whether they had been committed meanwhile: an ordinary
+/// reservation can be, with no word to us. A placeholder cannot (a commit
+/// there fails); only a view mapped over it makes memory appear, the
+/// runtime alone maps those, and [`title_memory_remapped`] forgets the
+/// blocks' absence each time. In the prologue's cell that question was
+/// 8.5 ms a frame of the submitting thread in `VirtualQuery`
+/// (fxceless/victory-fork#1238 reports the same).
+fn absent_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ABSENT_ONCE").is_none_or(|v| v != "0"))
+}
+
+/// The runtime reserved `[at, at + len)` for the title at an address of
+/// its choice: as a placeholder (64 KiB pages, to take physical pages
+/// later) or not. A reservation that is none ends what was noted of
+/// placeholders there before (the title released one and the address was
+/// given out again).
+pub fn title_memory_placeholder(at: usize, len: usize, placeholder: bool) {
+    if at == 0 || len == 0 {
+        return;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut g = guards();
+    let over: Vec<(usize, usize)> = g
+        .placeholders
+        .range(..last)
+        .filter(|&(_, &end)| end > first)
+        .map(|(&from, &end)| (from, end))
+        .collect();
+    for (from, end) in over {
+        g.placeholders.remove(&from);
+        // What lies outside the new reservation stays as it was noted.
+        if from < first {
+            g.placeholders.insert(from, first);
+        }
+        if end > last {
+            g.placeholders.insert(last, end);
+        }
+    }
+    if placeholder {
+        g.placeholders.insert(first, last);
+    }
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -634,6 +696,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
+    placeholders: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -683,6 +746,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
+    let once = absent_once();
+    // The placeholder reservation the loop stands in: first block and the
+    // block past its last (none: an empty range).
+    let mut placeholder = (first, first);
     for block in first..=last {
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
@@ -690,14 +757,23 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
         let mut open = block < last && !is_clean;
         if open && g.absent.contains(&block) {
-            // Ordinary commits need no runtime mapping notification. Reuse
-            // this asking's query for the following blocks in the same region.
-            if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
+            if once && !(placeholder.0 <= block && block < placeholder.1) {
+                placeholder = (block, g.placeholder_end(block).unwrap_or(block));
             }
-            open = block >= uncommitted_until;
-            if open {
-                g.absent.remove(&block);
+            if once && block < placeholder.1 {
+                // Absent in a placeholder: so it stays until the runtime
+                // maps it and says so (`absent_once`).
+                open = false;
+            } else {
+                // Ordinary commits need no runtime mapping notification. Reuse
+                // this asking's query for the following blocks in the same region.
+                if block >= uncommitted_until {
+                    uncommitted_until = uncommitted_end(block);
+                }
+                open = block >= uncommitted_until;
+                if open {
+                    g.absent.remove(&block);
+                }
             }
         }
         if open {
