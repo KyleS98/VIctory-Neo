@@ -1759,10 +1759,44 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
         Ok(g) => g,
         // (Held by this, whoever panicked with it: not to be asked for again.)
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner())),
+        Err(std::sync::TryLockError::WouldBlock) => waited(3, guards_awake),
     };
     settle(&mut g);
     g
+}
+
+/// The guards' lock, held by another thread: waited for awake at first
+/// (`VICTORY_GUARDS_SPIN=<microseconds>` at most, 0: not at all, asleep at
+/// once as before), then asleep.
+///
+/// The lock is held a few microseconds at a time (some bits, or one change
+/// of a run of blocks' protection) and taken thousands of times a frame by
+/// the thread that prepares submissions and the six that share its
+/// refreshes, all at once, and by the title's threads in their write
+/// faults. Asleep, a thread is woken in 50 microseconds and more: a profile
+/// of the prologue's cell (RTX 3090 Ti, Series S profile, 31 frames a
+/// second) had the preparing thread 2.2 ms of a 32 ms frame in this wait
+/// alone, and each of the six helpers as long.
+fn guards_awake() -> std::sync::MutexGuard<'static, Guards> {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let most = *MOST.get_or_init(|| std::env::var("VICTORY_GUARDS_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if most > 0 {
+        let began = std::time::Instant::now();
+        loop {
+            for _ in 0..24 {
+                std::hint::spin_loop();
+            }
+            match GUARDS.try_lock() {
+                Ok(g) => return g,
+                Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if began.elapsed().as_micros() as u64 >= most {
+                break;
+            }
+        }
+    }
+    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
