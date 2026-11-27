@@ -1,7 +1,7 @@
 # VIctory-Neo
 
 **The Xbox Series build of the title, running on a Windows PC from your own
-files: about 31 frames a second, and about 53 on screen with frame generation.**
+files: about 31 frames a second, and 53 to 132 on screen with frame generation.**
 
 VIctory-Neo is a build of [VIctory](https://github.com/Marvisak/VIctory), the
 compatibility layer that runs an Xbox Series title natively on Windows. The
@@ -23,6 +23,7 @@ shows it), medians over the 5-second readings of a run, hands off.
 |---|---|---|
 | Prologue, the cell (4,300 to 4,700 draws a frame) | Series S, 1920x1080 out | **31** (readings 27 to 33) |
 | the same | Series S, DLSS Quality and AMD FSR 3 frame generation | **27 rendered, 53 shown** (F3: `FPS: 26.4  FG: 52.8`) |
+| the same | Series S, DLSS Quality and DLSS frame generation through MFG Unlocker (a mod, below), 2x / 3x / 4x / 6x | 24 / 23 / 22.5 / 22 rendered; **48 / 72 / 92 / 132 shown** (F3 at 6x: `FPS: 21.5  FG: 129.0`) |
 | Opening cutscene | Series S | about 28 on average, 20 to 37 by shot |
 | Prologue, the cell | Series X, scene 1920x1080, 2560x1440 out | 26 |
 | Prologue, the cell | Series X, native 2560x1440 | 23 |
@@ -48,6 +49,9 @@ cell at 17 to 19 frames a second.
   rays: a few frames a second and a broken picture.
 - **Haze through windows.** Bright views through glass (the cell's window)
   are smeared; cause not found yet.
+- **A dark patch on a wall, in some runs.** In about one run in ten, the
+  wall to the left of the character in the cell shows a dark patch with
+  blocky edges for the whole run; cause not found yet.
 - **Hitches** when the title streams a new scene in, and during the first
   launches while shaders are translated and pipelines made (see below).
 - **Above 30 frames a second the game runs a little fast.** The title steps
@@ -87,6 +91,28 @@ target\release\victory.exe play "D:\MyDump\game_scarlett_master.exe" --series-s 
 
 On an RTX 40 or 50, `--framegen 2` (or more, on an RTX 50) uses DLSS frame
 generation instead; that was not measured here.
+
+**Up to 132 on screen on an RTX 20 or 30, with a mod.**
+[MFG Unlocker](https://github.com/dashdogy/MFG-Unlocker) is someone else's
+mod (MIT licence, not signed): it lets DLSS frame generation, and more than
+one generated frame per real one, run on RTX 20 and 30 cards. The launcher
+fetches the release it was written for and checks it against its published
+SHA-256 (`get-mfg`); it is loaded into `victory.exe` only when you turn it on:
+
+```powershell
+target\release\victory.exe get-dlss
+target\release\victory.exe get-mfg
+target\release\victory.exe play "D:\MyDump\game_scarlett_master.exe" --series-s --dlss quality --framegen 4 --fg-type dlss --set VICTORY_MFG_UNLOCKER=1
+```
+
+`--framegen` takes 2 to 6; F1, MFG UNLOCKER switches it on and off later.
+Backspace opens the mod's own menu, which also opens by itself on its first
+start. **The trade-off:** DLSS frame generation costs this card more than
+FSR 3 does (22 to 24 real frames a second instead of 27), and frame
+generation never makes the game answer faster: at 4x you see 92 frames a
+second, but the game still reacts at about 22. For the quickest response
+use FSR 3 at 2x, or no frame generation (31). Keep the shown rate under your
+monitor's refresh rate.
 
 - **The first launches are slow, and that is expected.** The first start
   translates the title's shaders (minutes) and the driver compiles each
@@ -147,9 +173,10 @@ now in draft). The translator proves only some of these loops and runs the
 rest as loops that cost four group barriers a pass on a card whose waves are
 half as wide as the console's. A check of the loop's shape proved 32,106
 more of them, and the cell went from 31 to 32 to 33 frames a second (62 shown
-with frame generation). But in 3 runs of 5 a wall in the cell then showed a
-dark patch with tile-aligned edges, which it never shows without the change,
-so it was taken out again until the cause is found.
+with frame generation). It was taken out again because a wall in the cell
+then showed a dark patch in 3 runs of 5. The same patch later turned up
+without the change too (1 run of 10), so it is an older fault; whether the
+change makes it more likely is being measured before it goes back in.
 
 Also in the tree, off by default: `VICTORY_GUARDS_SPIN=<microseconds>`, a
 shorter wait on the write tracker's lock. A profile had the thread that
