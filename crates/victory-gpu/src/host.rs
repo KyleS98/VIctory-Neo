@@ -9055,6 +9055,23 @@ impl Host {
                         overlay,
                         overlay_state,
                     );
+                    // The frame rate into the corner of what is shown, as
+                    // with one plane (the box is a copy onto the back
+                    // buffer; the pass above leaves it in the present
+                    // state). Without it a Series S run had no corner box
+                    // and no load line in the log, where a Series X run of
+                    // the same build has both.
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    crate::fpsbox::draw(self, list, &back, (width, height, format));
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    )]);
                     copy.close();
                     match slot {
                         Some(i) => {
@@ -9063,7 +9080,18 @@ impl Host {
                         }
                         None => self.execute(&[copy]),
                     }
-                    let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+                    // As with one plane: what Present answers is said once
+                    // if it is an error.
+                    let shown = p.swap_chain.Present(0, DXGI_PRESENT(0));
+                    if shown.is_err() {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| {
+                            tracing::error!(
+                                "Present answered {:#010x} (said once): the first call to report it, frame {frame} (two planes)",
+                                shown.0 as u32
+                            );
+                        });
+                    }
                     p.meter.frame(p.hwnd);
                     return Some(false);
                 }
