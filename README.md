@@ -111,13 +111,16 @@ the PC above and sent to that project as a pull request:
    dearer of the two. 28.5 to 30.9 frames a second in the cell, 88 to 38 MB
    of title memory copied a frame. (With DLSS or frame generation set up the
    title's FidelityFX path is left as it is: they need it.)
-2. **The picture no longer depends on which launches filled the pipeline
-   cache.** On an NVIDIA card a pipeline loaded from the driver's library
-   could sample with the wrong sampler when an earlier launch had made its
-   static samplers in another order: a print missing from a shirt here, wrong
-   shadows and bright yellow hair on another tree. The order is now kept in a
-   small file beside the library, and the same in every launch.
-   ([The fault, measured](https://github.com/fxceless/victory-fork/issues/1459).)
+2. **A pipeline cache left by other launches is dropped once.** Here a cache
+   filled by launches of other configurations drew a shirt without its
+   print, and a fresh one drew it right. Neo drops a cache it has not
+   written its list of static samplers beside, once; every launch then
+   makes those samplers in the same order. That order is what goes wrong
+   on fxceless's tree ([measured](https://github.com/fxceless/victory-fork/issues/1459)),
+   but on this tree pipelines with static samplers never come from the
+   cache, so **the cause of the missing print here is not known yet**: the
+   fresh cache is what fixed it, not the order. (Pull request in draft
+   until that is tested.)
 
 Also in the tree, off by default: `VICTORY_GUARDS_SPIN=<microseconds>`, a
 shorter wait on the write tracker's lock. A profile had the thread that
