@@ -1,7 +1,7 @@
 # VIctory-Neo
 
 **The Xbox Series build of the title, running on a Windows PC from your own
-files: about 32 frames a second, and over 60 on screen with frame generation.**
+files: about 31 frames a second, and about 53 on screen with frame generation.**
 
 VIctory-Neo is a build of [VIctory](https://github.com/Marvisak/VIctory), the
 compatibility layer that runs an Xbox Series title natively on Windows. The
@@ -21,11 +21,11 @@ shows it), medians over the 5-second readings of a run, hands off.
 
 | Scene | Profile | Frames a second |
 |---|---|---|
-| Prologue, the cell (4,300 to 4,700 draws a frame) | Series S, 1920x1080 out | **32** (readings 29 to 33) |
-| the same | Series S, DLSS Quality and AMD FSR 3 frame generation | **31 rendered, 62 shown** (F3: `FPS: 31.1  FG: 62.2`) |
-| Opening cutscene | Series S | about 28 on average, 20 to 37 by shot (before the shader change below) |
-| Prologue, the cell | Series X, scene 1920x1080, 2560x1440 out | 26 (before the shader change below) |
-| Prologue, the cell | Series X, native 2560x1440 | 23 (before the shader change below) |
+| Prologue, the cell (4,300 to 4,700 draws a frame) | Series S, 1920x1080 out | **31** (readings 27 to 33) |
+| the same | Series S, DLSS Quality and AMD FSR 3 frame generation | **27 rendered, 53 shown** (F3: `FPS: 26.4  FG: 52.8`) |
+| Opening cutscene | Series S | about 28 on average, 20 to 37 by shot |
+| Prologue, the cell | Series X, scene 1920x1080, 2560x1440 out | 26 |
+| Prologue, the cell | Series X, native 2560x1440 | 23 |
 
 - The boot screens, the account picker, the loading art and the opening
   cutscene play in order, and the prologue's first room stands.
@@ -52,7 +52,7 @@ cell at 17 to 19 frames a second.
   launches while shaders are translated and pipelines made (see below).
 - **Above 30 frames a second the game runs a little fast.** The title steps
   its world at least 1/30 s a frame. `--fps 30` holds it at its own rate.
-  (Frames made by frame generation do not count: 31 rendered is 31.)
+  (Frames made by frame generation do not count: 27 rendered is 27.)
 - **Frame generation adds latency** (about one rendered frame), as it does
   in any game, and its in-between frames can smear fast motion.
 - **Memory.** On this PC it takes up to 43 GB of RAM, with a 24 GB card that
@@ -76,8 +76,8 @@ target\release\victory.exe play "D:\MyDump\game_scarlett_master.exe" --series-s
 Put the path of **your** `game_scarlett_master.exe` in the last line. That is
 all: the settings these numbers were measured with are built in.
 
-**60 on screen on an RTX 20 or 30** (AMD FSR 3 frame generation, with DLSS
-doing the upscaling):
+**More on screen on an RTX 20 or 30** (AMD FSR 3 frame generation, with DLSS
+doing the upscaling; 53 shown here):
 
 ```powershell
 target\release\victory.exe get-dlss     # once: NVIDIA's DLSS files, from NVIDIA's GitHub
@@ -95,7 +95,7 @@ generation instead; that was not measured here.
   what it needed, so it gets smoother over the first two or three.
 - **The first start asks once whether to download NVIDIA's DLSS files**
   (RTX cards). Either way works: in the cell DLSS Quality measured 31.4 and
-  Performance 31.7 against 30.9 without it, before the shader change below.
+  Performance 31.7 against 30.9 without it.
   The card's time there goes to the number of commands, not to pixels.
 - **Known crash, with a way round it:** with AMD's FSR 3 files fetched and
   `--dlss off`, the start prepares FSR 3 and the program ends during the boot
@@ -123,7 +123,7 @@ NVIDIA's and AMD's, under their licences, fetched from their own GitHub by
 
 ## What Neo adds
 
-Three changes on top of the tree it is built on, each measured in the game on
+Two changes on top of the tree it is built on, each measured in the game on
 the PC above and sent to that project as a pull request:
 
 1. **The Series S profile keeps the title's own upscaler** where no DLSS is
@@ -141,17 +141,15 @@ the PC above and sent to that project as a pull request:
    cache, so **the cause of the missing print here is not known yet**: the
    fresh cache is what fixed it, not the order. (Pull request in draft
    until that is tested.)
-3. **The console's per-lane descriptor loops run once instead of once per
-   distinct value.** The console's compiler loops over a per-lane descriptor
-   (read the first lane's table offset, serve the lanes with the same one,
-   repeat). The translator turns such a loop into one per-lane load only when
-   it can prove it, and in the title's shaders it mostly could not: 44,874
-   loops were refused. Run on a card whose waves are half as wide as the
-   console's, each pass of such a loop costs four group barriers. A check of
-   the loop's exact shape now proves 32,106 of them. The costliest shader of
-   the frame (a decal pass, 4 ms of the card's time) went from 149 barriers
-   to 41, and the cell from 30.8 to 32 to 33 frames a second
-   ([pull request](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/458)).
+In progress, not in the build: **the console's per-lane descriptor loops run
+once instead of once per distinct value** (a [pull request](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/458),
+now in draft). The translator proves only some of these loops and runs the
+rest as loops that cost four group barriers a pass on a card whose waves are
+half as wide as the console's. A check of the loop's shape proved 32,106
+more of them, and the cell went from 31 to 32 to 33 frames a second (62 shown
+with frame generation). But in 3 runs of 5 a wall in the cell then showed a
+dark patch with tile-aligned edges, which it never shows without the change,
+so it was taken out again until the cause is found.
 
 Also in the tree, off by default: `VICTORY_GUARDS_SPIN=<microseconds>`, a
 shorter wait on the write tracker's lock. A profile had the thread that
