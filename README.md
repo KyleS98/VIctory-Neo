@@ -1,308 +1,173 @@
-# VIctory on NVIDIA
+# VIctory-Neo
 
-## Quick start: how to run it
+**The Xbox Series build of the title, running on a Windows PC from your own
+files, at about 30 frames a second.**
 
-**The easy way: one file, nothing to build**
+VIctory-Neo is a build of [VIctory](https://github.com/Marvisak/VIctory), the
+compatibility layer that runs an Xbox Series title natively on Windows. The
+title's own x86-64 code runs on your processor; the layer provides the
+console's system calls and translates its graphics to Direct3D 12.
 
-1. Download `victory.exe` from the
-   [latest release](https://github.com/trustno1-coder/VIctory-NVIDIA/releases/latest).
-2. Put it into the folder of **your own dump** of the title's Xbox Series
-   build v1.0.2.1, next to `game_scarlett_master.exe`.
-3. Double-click it. Windows may say the publisher is unknown (the file is not
-   signed): "More info", then "Run anyway".
+> **No game files are here, and none ever will be.** You need your own legally
+> obtained dump of the title's Xbox Series build v1.0.2.1. This project is not
+> affiliated with or endorsed by the title's developer or publisher, nor by
+> NVIDIA. See [docs/asset-policy.md](docs/asset-policy.md).
 
-- The first start asks once whether to download NVIDIA's DLSS and frame
-  generation files (about 70 MB) from NVIDIA's own GitHub. They are NVIDIA's
-  and are not part of this program; say no and the game still runs, with its
-  own upscaling and no frame generation.
-- Nothing is written into your game folder: settings, saves, caches, logs and
-  NVIDIA's files are kept under `%LOCALAPPDATA%\victory`.
-- You need Windows 10 or 11, 32 GB of RAM or more, an SSD and an NVIDIA
-  GeForce RTX card with a recent driver. This repository and its releases
-  contain no game files.
+## What it does today
 
-**In the game**
+Measured on one PC: **GeForce RTX 3090 Ti 24 GB** (driver 616.92), Ryzen 9
+9950X3D, 64 GB RAM, Windows 11. Frame rates are the layer's own count (F3
+shows it), medians over the 5-second readings of a run, hands off.
 
-- **F1** brings up the settings menu (arrow keys pick and change, Enter does
-  it): DLSS, frame generation, frame rate cap and more.
-- **F3** shows the stats panel (frame rate, frame generation, draws, GPU and
-  memory numbers).
+| Scene | Profile | Frames a second |
+|---|---|---|
+| Prologue, the cell (4,300 to 4,700 draws a frame) | Series S, 1920x1080 out | **31** (readings 29 to 34) |
+| Opening cutscene | Series S | about 28 on average, 20 to 37 by shot |
+| Prologue, the cell | Series X, scene 1920x1080, 2560x1440 out | 26 |
+| Prologue, the cell | Series X, native 2560x1440 | 23 |
 
-**Building it yourself instead**
+- The boot screens, the account picker, the loading art and the opening
+  cutscene play in order, and the prologue's first room stands.
+- Characters, hair, clothes and their prints, textures, sky and sun are drawn.
+- No crash and no lost graphics device in the runs these numbers come from
+  (a dozen, 5 to 10 minutes each, standing in the cell). Longer sessions,
+  play with a pad or keyboard and mouse, and anything past the prologue are
+  **not measured here yet**; the projects this is built on have played to the
+  first boat mission (see [Built on](#built-on)).
 
-Install [Rust](https://rustup.rs) and the
-[Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-with "Desktop development with C++", then in PowerShell:
+On the same PC, fxceless/victory-fork's `main` of the same day runs the same
+cell at 17 to 19 frames a second.
+
+### What is not right yet
+
+- **No ray tracing.** The title traces its indirect light, reflections and
+  some shadows itself, and no layer runs that fast enough yet. An estimate
+  stands in for indirect light and reflections (foxhound's work): rooms are
+  lit, reflections are blurry. `VICTORY_BVH_BUILDER=1` runs the title's own
+  rays: a few frames a second and a broken picture.
+- **Haze through windows.** Bright views through glass (the cell's window)
+  are smeared; cause not found yet.
+- **Hitches** when the title streams a new scene in, and during the first
+  launches while shaders are translated and pipelines made (see below).
+- **Above 30 frames a second the game runs a little fast.** The title steps
+  its world at least 1/30 s a frame. `--fps 30` holds it at its own rate.
+- **Memory.** On this PC it takes up to 43 GB of RAM, with a 24 GB card that
+  it fills with textures. Close what you can. foxhound measures 20 GB in use
+  (28 GB committed) on a 32 GB PC with a 12 GB card.
+
+## Quick start
+
+You need: Windows 10 or 11, a Direct3D 12 card with mesh shaders and shader
+model 6.6 (measured on NVIDIA RTX; AMD runs, with less attention), 32 GB of
+RAM or more, an SSD, [Rust](https://rustup.rs) and the Visual Studio Build
+Tools with "Desktop development with C++".
 
 ```powershell
-git clone https://github.com/trustno1-coder/VIctory-NVIDIA
-cd VIctory-NVIDIA
-.\Get-NVIDIA-DLSS.cmd
-powershell -ExecutionPolicy Bypass -File scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
+git clone https://github.com/KyleS98/VIctory-Neo
+cd VIctory-Neo
+cargo build --release --locked -p victory
+target\release\victory.exe play "D:\MyDump\game_scarlett_master.exe" --series-s
 ```
 
-Put the path to **your** `game_scarlett_master.exe` in the last line. The
-first start builds the layer, which takes a few minutes.
+Put the path of **your** `game_scarlett_master.exe` in the last line. That is
+all: the settings these numbers were measured with are built in.
 
-Options, requirements in full and the details are under
-[How to run it](#how-to-run-it).
+- **The first launches are slow, and that is expected.** The first start
+  translates the title's shaders (minutes) and the driver compiles each
+  pipeline the first time it is drawn. A launch may even end in the title's
+  own watchdog while that goes on; start it again. Each launch writes down
+  what it needed, so it gets smoother over the first two or three.
+- **The first start asks once whether to download NVIDIA's DLSS files**
+  (RTX cards). Answer `n` for what was measured here; with them, DLSS takes
+  the title's upscaling and the numbers above no longer apply.
+- **F3** shows the stats panel, **F1** the settings menu (console profile,
+  picture size, frame rate cap, the light estimate and the main switches).
+- Nothing is written into your game folder: caches, saves, settings and logs
+  are under `%LOCALAPPDATA%\victory`.
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files **you** supply,
-tuned for **NVIDIA RTX** cards.
-
-> **This repository contains no game files, code or assets.** You need your
-> own legally obtained copy of the title. It is not affiliated with or endorsed
-> by the title's developer or publisher, nor by NVIDIA. See
-> [docs/asset-policy.md](docs/asset-policy.md).
-
-## Built from many projects, and from running every one of them
-
-This repository did not come from one place, and the base it stands on today
-is the end of a long comparison, not the start of the work. Over several weeks
-we built, ran and measured many projects on the same NVIDIA PC: Leonida,
-[Marvisak's VIctory](https://github.com/Marvisak/VIctory),
-[fxceless's fork](https://github.com/fxceless/victory-fork),
-[the 7900 XTX fork](https://github.com/avatarmanz/VIctory-7900XTX),
-[Belobug's](https://github.com/Belobug/VIctory-Belobug-AMD),
-[DexNom's](https://github.com/DexNom/VIctory),
-[CGBJ's cool_fox](https://github.com/codec-d/cool_fox), Kelvaroq's, Neptune,
-xcl (another layer for the same title) and then
-[foxhound](https://github.com/readmet3xt-lab/foxhound). On each we found what
-stopped it on an RTX card, fixed or worked around it, measured the result, and
-carried what we learned to the next. Every pull request sent here was built
-and run on the same card before it was merged. No single project got here
-alone, and choosing the base that runs best was only one result of that work.
-
-### What this fork brings
-
-Not one fix but a long line of them: days of work, much of it around the clock,
-across every one of those codebases, more than 300 measured runs on the same
-RTX PC, and each fault chased towards its cause before the next build. In rendering, in
-speed, in the picture and in simply being able to play it:
-
-**Rendering fixes**
-
-- **Draws no longer skipped on NVIDIA.** NVIDIA caps the view heap below what
-  the title asks for; thousands of draws a frame were dropped, the screen
-  rarely updated and the character jumped from place to place. The pool of
-  descriptor slots was reworked until almost none were.
-- **Menus, loading screens and subtitles on Series S**, black until then (the
-  interface plane laid over the game), and **faces that move** (their network
-  carried through as integers): ported from fxceless's pull requests 1189 and
-  927 and made to work on this card.
-- **The intro video without flicker**: its frames came out of order.
-- **Black blobs gone**: a single bad number from a shader, spread by blur and
-  the upscaler into patches on faces and in the air, is caught where it is
-  written.
-- **White, hazy rooms explained and tamed**: the title's ray tracing was
-  running with its structure builder off, so every ray missed. Which passes
-  can be left out without filling the picture with rainbow glitter was worked
-  out pass by pass.
-- **The ray-tracing structure builder running on NVIDIA**, on CGBJ's renderer:
-  the draws dropped for it went from thousands a frame to one.
-- **White-outs with black holes further into the game** followed up in frames
-  captured in play: thousands of draws a frame were being dropped there for
-  that same missing structure.
-
-**Speed**
-
-- **Memory compares moved to the card**: 11 to about 22 frames a second on the
-  base of the time.
-- **Settings measured, not guessed**: one switch at a time, on the same scene,
-  run after run.
-- **The base itself chosen by measurement**: the same rooms went from 15-17
-  frames a second to 26-30, at a higher resolution.
-- **The 30 frames a second were the title's own frame interval**, not the
-  layer's limit: found, and lifted.
-
-**Picture and frames**
-
-- **DLSS in place of the title's upscaler**, with its model and mode to choose.
-- **DLSS frame generation with up to six frames shown for each one rendered**,
-  switched and changed while playing, without a restart (foxhound's is 2x, set
-  at the start). By Streamline's own count it shows exactly 2, 4 and 6.
-- **Why frame generation showed nothing on a full 12 GB card**, found and
-  fixed: the card's memory is now shared out so that it has room.
-- **The frame rate at the top left of the picture**: frames rendered a second
-  and, with frame generation, frames shown (`FPS: 28.4  FG: 170.4`).
-
-**Playing it**
-
-- **The F1 settings menu**, in every build: DLSS, frame generation, frame rate
-  cap, console profile, picture size, the light estimates and the main speed
-  switches, saved to `victory-settings.txt` and applied at the next start
-  ("SAVE AND RESTART NOW" does that for you; lines marked LIVE change at once).
-- **The F3 stats panel**, in every build: frame rate and frame time, frames
-  shown with frame generation, draws, how busy the GPU and the submitting
-  thread are, copies, RAM and VRAM. The menu switches it too.
-- **Open water without dark blocks.** Two of the title's water light programs
-  run on 32-lane cards only in a form that left whole tiles of the sea dark
-  (around boats, along shores, under bridges) and cost about 15 ms of the
-  card a frame. They are left out there: no blocks and 30 fps instead of 25
-  on the first boat ride (RTX 5070), with water that is darker and bluer.
-  WATER LIGHT in the menu (`VICTORY_WATER_LIGHT=1`) runs them again.
-- **One command to play**: the launcher builds the layer the first time and
-  applies what the menu saved.
-- **`Get-NVIDIA-DLSS.cmd`**: the eight NVIDIA files that are loaded, about
-  70 MB, taken out of NVIDIA's 263 MB release without downloading the rest.
-  NVIDIA's licence does not let a repository carry them, so they come from
-  NVIDIA.
-
-**Tested, not assumed**
-
-- Every pull request sent here was read line by line and, where it touched the
-  game, built and run on this card before it was merged: ten so far.
-
-Where each of these is today: this fork's own code in this tree is the F1
-menu, the stats panel in every build, the water light switch, frame
-generation from 2x to 6x with its live switching and memory handling, the
-lifted frame rate cap, the frame rate line, the launcher and the NVIDIA file
-fetcher. The foxhound line carries the descriptor slots, the
-compares on the card, the interface plane and the face network in its own
-form. The black-blob scrub, the graphics card picker and the ray-tracing
-builder path are in this repository's history, and come over as this base
-turns out to need them.
-
-### The base since 2026-11-26: foxhound
-
-On 2026-11-26 this fork moved onto
-[readmet3xt-lab/foxhound](https://github.com/readmet3xt-lab/foxhound)
-(`02fc18a`, GPL-3.0-or-later). On the same PC it ran the same rooms at close to
-twice the frame rate of what this fork had, at a higher resolution, so its
-tree is now this one's, with its history kept, and this fork's own additions
-are on top. What foxhound is and how it got there is in its own README, kept as
-[docs/README-foxhound.md](docs/README-foxhound.md); its measurements are in
-[docs/findings.md](docs/findings.md).
-
-What foxhound brings:
-
-- the Series X profile at a native 2560x1440;
-- DLSS Super Resolution and DLSS Frame Generation through NVIDIA Streamline,
-  loaded when the game runs (nothing of NVIDIA's is needed to build);
-- an estimate of indirect light and of reflections in place of the title's ray
-  tracing, and fewer stalls at scene cuts.
-
-What this fork has on top of it is under
-[What this fork brings](#what-this-fork-brings) above.
-
-## Where it stands
-
-Tested on one PC: Windows 11, Ryzen 7 9800X3D, 64 GB RAM, **GeForce RTX 5070
-12 GB**; the title's Xbox Series build v1.0.2.1, Series X profile, 2560x1440
-output, DLSS Quality. Frame rates are the layer's own count, in the opening
-rooms.
+Other ways to run it:
 
 | | |
 |---|---|
-| Opening rooms | mostly 26-30 frames a second rendered (33-38 ms a frame) |
-| Frame generation | 2x to 6x on top of that: by Streamline's own count, exactly 2, 4 and 6 frames shown for each one rendered |
-| Device losses, crashes | none in the measured runs |
-| Before this base (Series S, 720p to 1080p by DLSS) | 15-17 frames a second in the same rooms |
+| `victory.exe play <exe>` | Series X profile at 2560x1440: sharper, slower (23 here) |
+| `victory.exe play <exe> --res 1080to1440` | Series X, scene at 1920x1080 (26 here) |
+| `victory.exe play <exe> --series-s --fps 30` | the title's own frame rate, game speed exact |
+| `victory.exe play <exe> --series-s --set VICTORY_X=1` | add or override a switch |
+| `scripts\play-foxhound.ps1 -Exe <exe> -SeriesS` | the same from PowerShell, with a log file |
 
-foxhound's own measurements, on an RTX 4070 SUPER, are in its README.
+**DLSS** (RTX cards) and **DLSS frame generation** (RTX 40 and 50) come with
+the tree this is built on: `Get-NVIDIA-DLSS.cmd` fetches NVIDIA's files from
+NVIDIA (they are NVIDIA's, under NVIDIA's licence, and not part of this
+repository); [docs/dlss.md](docs/dlss.md) has the details. They were **not
+measured here**: the numbers above are without them.
 
-What is known to be wrong:
+## What Neo adds
 
-- **No ray tracing.** The title's own is off (`VICTORY_BVH_BUILDER=1`, or the
-  menu's RAY TRACING, turns it on: slow and with a broken picture on this
-  base). An estimate stands in for indirect light and reflections.
-- **Frame generation needs room in the card's memory.** The layer fills the
-  card with textures up to its budget; with frame generation on from the start
-  the launcher holds a fifth of the budget back (a little less while it is only
-  ready), so a few more textures can come late. Switched on from the menu on a
-  full 12 GB card it can still say that memory is past the budget; it then
-  runs, perhaps unevenly.
-- **Frames are only generated while the game's window has the focus**, and
-  about a second passes after a change before they come.
-- **The first run of every new build stutters** while the driver compiles
-  pipelines (foxhound's README, *Warming up*, says how to make them ahead).
-- "SAVE AND RESTART NOW" can leave the old game's process behind without a
-  window; it goes when the PC restarts.
-- What foxhound lists as wrong (the heat-haze pass left out, hitches in
-  cutscenes) applies here too.
+Two changes on top of the tree it is built on, each measured in the game on
+the PC above and sent to that project as a pull request:
 
-## How to run it
+1. **The Series S profile keeps the title's own upscaler** where no DLSS is
+   set up. The title picks FSR 4 on a Series S; translated, that is the
+   dearer of the two. 28.5 to 30.9 frames a second in the cell, 88 to 38 MB
+   of title memory copied a frame. (With DLSS or frame generation set up the
+   title's FidelityFX path is left as it is: they need it.)
+2. **The picture no longer depends on which launches filled the pipeline
+   cache.** On an NVIDIA card a pipeline loaded from the driver's library
+   could sample with the wrong sampler when an earlier launch had made its
+   static samplers in another order: a print missing from a shirt here, wrong
+   shadows and bright yellow hair on another tree. The order is now kept in a
+   small file beside the library, and the same in every launch.
+   ([The fault, measured](https://github.com/fxceless/victory-fork/issues/1459).)
 
-You need Windows 10 or 11 (x64), a CPU with AVX2, 32 GB of RAM or more, an
-SSD, an NVIDIA GeForce RTX card with a recent driver (RTX 40 or later for frame
-generation, with hardware-accelerated GPU scheduling on; more than 2x needs an
-RTX 50), [Rust](https://rustup.rs) (the toolchain is pinned), the Visual Studio
-Build Tools with "Desktop development with C++", and **your own dump** of the
-title's Xbox Series build v1.0.2.1 (the folder with
-`game_scarlett_master.exe`).
+Also in the tree, off by default: `VICTORY_GUARDS_SPIN=<microseconds>`, a
+shorter wait on the write tracker's lock. A profile had the thread that
+prepares the card's work asleep behind that lock 2 ms of every 32 ms frame.
+With the switch at 40 that thread's time fell by 2 ms in one pair of runs
+and by nothing in another, and the frame rate did not move in either: the
+graphics card is as close to its limit as that thread is. It is there for
+whoever measures on a faster card.
 
-```powershell
-git clone https://github.com/trustno1-coder/VIctory-NVIDIA
-cd VIctory-NVIDIA
-copy victory.example.toml victory.toml      # then set game_dir to your dump's folder, outside this one
-.\Get-NVIDIA-DLSS.cmd                        # once: NVIDIA's DLSS and frame generation files, about 70 MB
-scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
-```
+Found with the tree's own tools: its frame line and timing run, its sampling
+profiler, and A/B switches that flip while the game runs.
 
-The first start builds the layer (a few minutes). `Get-NVIDIA-DLSS.cmd` gets
-NVIDIA's files from
-[NVIDIA-RTX/Streamline](https://github.com/NVIDIA-RTX/Streamline) into
-`nvidia-sdk\` (git-ignored). They are NVIDIA's, under NVIDIA's licences, which
-are saved beside them; this repository does not carry them and may not. Nothing
-is downloaded unless you run that file; `VICTORY_STREAMLINE_DIR` names another
-folder if you have the Streamline SDK already.
+## Built on
 
-`scripts\play-nvidia.ps1` is `scripts\play-foxhound.ps1` under the name this
-fork has always had; its options:
+Neo is the newest link of a chain, and nearly all of the code is other
+people's:
 
-| Option | What |
-|---|---|
-| *(none)* | Series X profile, 2560x1440, DLSS Quality, no frame rate cap, frame generation ready but off |
-| `-FrameGen`, `-FrameGenX 4` | frame generation on from the start, 2 to 6 frames shown for each one rendered |
-| `-Dlss off` / `dlaa` / `balanced` / `performance` | the title's own upscaling, or another DLSS mode |
-| `-Fps 60` | a frame rate cap (30 is the title's own) |
-| `-SeriesS` | the Series S profile: 1280x720 inside, faster, softer |
-| `-Res 1080to1440` / `4k` | scene at 1080p upscaled by the title / the stock 3840x2160 output |
-| `-NoFrameGenReady` | frame generation only with `-FrameGen` (it is otherwise made ready at every start, so the menu can switch it) |
-| `-Build diag` | the diagnostics build (slower; captures, timelines, recording time in the F3 panel) |
-| `-More @{VICTORY_X='1'}` | add or override any switch |
+- **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)**: the loader, the
+  runtime, the Direct3D 12 back end and the shader recompiler.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** and the
+  people whose pull requests it carries: where most of the layer grew up.
+- **[readmet3xt-lab/foxhound](https://github.com/readmet3xt-lab/foxhound)**:
+  the base that first held 30 frames a second: list calls translated on
+  eight threads, work done on the card instead of waited for, the light
+  estimate, fewer stalls.
+- **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**:
+  the tree this one is taken from (its `main` of 2026-11-27): the launcher
+  built into the program, the F1 menu, the stats panel, DLSS and frame
+  generation, and the pull requests of its contributors.
+- And everyone those name: avatarmanz, DexNom, Belobug, Vice-Tay and more.
+  Their READMEs are kept here: [VIctory on NVIDIA](docs/README-nvidia.md),
+  [foxhound](docs/README-foxhound.md), [fxceless](docs/README-fxceless.md),
+  with what each found in [docs/findings.md](docs/findings.md).
 
-What the F1 menu saved (`victory-settings.txt`) goes over these at every start;
-delete that file to go back to them. Full screen: start the game, then run
-`.\scripts\fullscreen.ps1` in another window. Logs go to
-`%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`.
+Before 2026-11-27 `main` held an earlier snapshot of fxceless's line. It is
+still in `main`'s history, and our frame-rate work on that line (20 to 22
+frames a second in the same cell, with a print missing from the picture) is
+on the `integration/*` branches.
 
-## How it works, and the findings
+## Reporting a problem
 
-- [docs/README-foxhound.md](docs/README-foxhound.md): foxhound's own README
-  (set-up by hand, warming up, its switches).
-- [docs/architecture.md](docs/architecture.md): the layer's parts.
-- [docs/findings.md](docs/findings.md): measurements behind the choices.
-- [docs/dlss.md](docs/dlss.md): DLSS and Frame Generation.
-- [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md): the title's ray tracing
-  and the light estimate.
-- [docs/asset-policy.md](docs/asset-policy.md): what may and may not be in this
-  repository.
-
-## Credits
-
-A tree of other people's work with a little on top; the history is kept.
-
-- **[foxhound](https://github.com/readmet3xt-lab/foxhound)** by
-  readmet3xt-lab: the base of this fork since 2026-11-26, and through it:
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**,
-  **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**,
-  **[codec-d/cool_fox](https://github.com/codec-d/cool_fox)**,
-  **[DexNom/VIctory](https://github.com/DexNom/VIctory)**,
-  **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**
-  and the others foxhound's README names.
-- Everyone who sent pull requests to this fork before the move; that work is
-  in the history, on the branch that was `main` until then.
-- NVIDIA Streamline, DLSS and Reflex are NVIDIA's; they are loaded at run time
-  from a folder you supply.
-- Much of this fork's code was written with
-  [Claude Code](https://claude.com/claude-code).
+Open an issue with your card, driver, processor, RAM, the command you ran
+and what you saw, in words. The log of a run is under
+`%LOCALAPPDATA%\victory\logs`. **Never attach anything from the game**: no
+files, dumps, shader dumps or screenshots.
 
 ## License
 
-GPL-3.0-or-later, as VIctory and foxhound. See [LICENSE](LICENSE); the one file
-that is not covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is
+not covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+
+Much of this code, in every link of the chain, was written with AI
+assistance (here: Claude Code).
