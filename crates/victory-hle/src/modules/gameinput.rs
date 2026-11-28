@@ -167,15 +167,123 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+/// What a key of the stand-in pad is, where a start says so.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PadKey {
+    Button(u32),
+    LeftTrigger,
+    RightTrigger,
+}
+
+/// `VICTORY_PAD_KEYS=pc`: the keyboard as third-person games on a PC have
+/// it, on the pad layout that is usual for them (A run, X jump, Y into a
+/// vehicle, B reload, the left bumper the weapons, the right one cover, a
+/// press of the left stick crouch, of the right one a look back). With the
+/// mouse ([`Look`]): W/A/S/D walk, the mouse looks, its buttons shoot and
+/// aim.
+const PC_KEYS: &str = "LShift=A,Space=X,F=Y,R=B,Tab=LB,Q=RB,LCtrl=L3,C=R3,V=View";
+
+/// The keys a start gives the stand-in pad (`VICTORY_PAD_KEYS=<key>=<button>,...`,
+/// or `pc` for [`PC_KEYS`], or `pc` and more after it). A key named here is
+/// that button alone: what [`FALLBACK_BUTTONS`], the sticks' letters and the
+/// triggers' say of it no longer holds. Keys: a letter, a digit, `Space`,
+/// `Enter`, `Tab`, `Esc`, `Back`, `Up`, `Down`, `Left`, `Right`, `CapsLock`,
+/// `LShift`, `RShift`, `LCtrl`, `RCtrl`, `LAlt`, `RAlt`. Buttons: `A`, `B`,
+/// `X`, `Y`, `LB`, `RB`, `LT`, `RT`, `L3`, `R3`, `Menu`, `View`, `Up`,
+/// `Down`, `Left`, `Right`. What is not understood is said and left out.
+fn parse_pad_keys(text: &str) -> Vec<(u8, PadKey)> {
+    let key = |name: &str| -> Option<u8> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "space" => 0x20,
+            "enter" => 0x0D,
+            "tab" => 0x09,
+            "esc" => 0x1B,
+            "back" => 0x08,
+            "up" => 0x26,
+            "down" => 0x28,
+            "left" => 0x25,
+            "right" => 0x27,
+            "capslock" => 0x14,
+            "lshift" | "shift" => 0xA0,
+            "rshift" => 0xA1,
+            "lctrl" | "ctrl" => 0xA2,
+            "rctrl" => 0xA3,
+            "lalt" | "alt" => 0xA4,
+            "ralt" => 0xA5,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+            _ => return None,
+        })
+    };
+    let button = |name: &str| -> Option<PadKey> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "a" => PadKey::Button(A),
+            "b" => PadKey::Button(B),
+            "x" => PadKey::Button(X),
+            "y" => PadKey::Button(Y),
+            "lb" => PadKey::Button(LEFT_SHOULDER),
+            "rb" => PadKey::Button(RIGHT_SHOULDER),
+            "l3" => PadKey::Button(LEFT_STICK),
+            "r3" => PadKey::Button(RIGHT_STICK),
+            "menu" => PadKey::Button(MENU),
+            "view" => PadKey::Button(VIEW),
+            "up" => PadKey::Button(UP),
+            "down" => PadKey::Button(DOWN),
+            "left" => PadKey::Button(LEFT),
+            "right" => PadKey::Button(RIGHT),
+            "lt" => PadKey::LeftTrigger,
+            "rt" => PadKey::RightTrigger,
+            _ => return None,
+        })
+    };
+    let mut keys: Vec<(u8, PadKey)> = Vec::new();
+    for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if part.eq_ignore_ascii_case("pc") {
+            for (k, b) in parse_pad_keys(PC_KEYS) {
+                keys.retain(|(known, _)| *known != k);
+                keys.push((k, b));
+            }
+            continue;
+        }
+        match part.split_once('=').and_then(|(k, b)| Some((key(k.trim())?, button(b.trim())?))) {
+            Some((k, b)) => {
+                // The last word on a key holds.
+                keys.retain(|(known, _)| *known != k);
+                keys.push((k, b));
+            }
+            None => tracing::warn!(part, "VICTORY_PAD_KEYS: not a key and a button, left out"),
+        }
+    }
+    keys
+}
+
+fn pad_keys() -> &'static [(u8, PadKey)] {
+    static KEYS: LazyLock<Vec<(u8, PadKey)>> = LazyLock::new(|| {
+        let keys = parse_pad_keys(&std::env::var("VICTORY_PAD_KEYS").unwrap_or_default());
+        if !keys.is_empty() {
+            tracing::info!(keys = keys.len(), "the keyboard's stand-in pad has keys of the start's (VICTORY_PAD_KEYS)");
+        }
+        keys
+    });
+    &KEYS
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
+    fallback_with(keys, pad_keys())
+}
+
+/// The stand-in pad for the keys held, `given` being the start's own keys
+/// ([`parse_pad_keys`]).
+fn fallback_with(keys: &[KeyState], given: &[(u8, PadKey)]) -> PadState {
+    let held = |vk: u8| keys.iter().any(|k| k.virtual_key == vk);
+    // A key the start gave a button is no longer what the tables say.
     let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
+        if held(vk) && !given.iter().any(|(k, _)| *k == vk) {
             1.0
         } else {
             0.0
         }
     };
-    PadState {
+    let mut pad = PadState {
         buttons: FALLBACK_BUTTONS
             .iter()
             .filter(|(vk, _)| on(*vk) != 0.0)
@@ -186,7 +294,15 @@ fn fallback(keys: &[KeyState]) -> PadState {
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
+    };
+    for (_, key) in given.iter().filter(|(vk, _)| held(*vk)) {
+        match key {
+            PadKey::Button(bit) => pad.buttons |= bit,
+            PadKey::LeftTrigger => pad.left_trigger = 1.0,
+            PadKey::RightTrigger => pad.right_trigger = 1.0,
+        }
     }
+    pad
 }
 
 /// Two pads as one: buttons of both, and of each axis and trigger the one
@@ -201,6 +317,158 @@ fn merged(a: PadState, b: PadState) -> PadState {
         left_y: further(a.left_y, b.left_y),
         right_x: further(a.right_x, b.right_x),
         right_y: further(a.right_y, b.right_y),
+    }
+}
+
+/// The captured mouse as the stand-in pad's right stick and triggers
+/// (`VICTORY_MOUSE_LOOK`, on wherever the mouse is captured; `0`: the mouse
+/// is the GameInput mouse device alone, as before). The title turns its
+/// camera with a pad's right stick and with nothing else: with the pointer
+/// captured and 2,700 pixels of motion delivered as the mouse device the
+/// camera stood still, and it turned at once with the stand-in pad's stick
+/// (the prologue's cell, Series S profile, 2026-11-27).
+///
+/// A stick is a speed and a mouse a distance. What the pointer has moved is
+/// owed to the camera, and the stick is pushed to pay it within
+/// [`LOOK_PAY`]: a slow hand holds the stick as far as its speed is of
+/// `speed` pixels a second, and what a fast hand asks beyond the whole stick
+/// is kept (up to `bank` seconds of the whole stick) and turned after it,
+/// not lost. Any motion starts past the title's dead zone. The left button
+/// is the right trigger, the right button the left one, the middle button a
+/// press of the right stick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Look {
+    /// Pixels a second that push the stick all the way
+    /// (`VICTORY_MOUSE_LOOK_SPEED`).
+    speed: f32,
+    /// Where the stick stands as soon as the pointer moves, 0 to 1
+    /// (`VICTORY_MOUSE_LOOK_DEADZONE`, in percent).
+    dead_zone: f32,
+    /// The stick's way past the dead zone is the speed's share to this
+    /// power (`VICTORY_MOUSE_LOOK_CURVE`, in percent; 100: in proportion).
+    curve: f32,
+    /// Up and down against left and right (`VICTORY_MOUSE_LOOK_VERTICAL`,
+    /// in percent; negative: the other way up).
+    vertical: f32,
+    /// How much of a fast hand's motion is kept to be turned after it, in
+    /// seconds of the whole stick (`VICTORY_MOUSE_LOOK_BANK`, in
+    /// milliseconds; 0: none, the stick follows the pointer's speed alone).
+    bank: f32,
+}
+
+/// The seconds within which the stick pays what the pointer has moved: a
+/// frame and a half of the title at 30 a second, so each of its frames reads
+/// what the pointer did during the one before, and the stick does not flicker
+/// between the pointer's steps.
+const LOOK_PAY: f32 = 0.05;
+
+impl Look {
+    const DEFAULT: Look = Look { speed: 2400.0, dead_zone: 0.2, curve: 1.0, vertical: 1.0, bank: 0.35 };
+
+    /// What `get` (the environment) asks for; `None`: no mapping.
+    fn from(get: impl Fn(&str) -> Option<String>) -> Option<Look> {
+        if get("VICTORY_MOUSE_LOOK").is_some_and(|v| v.trim() == "0") {
+            return None;
+        }
+        let number = |name: &str| get(name).and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite());
+        let d = Look::DEFAULT;
+        Some(Look {
+            speed: number("VICTORY_MOUSE_LOOK_SPEED").map_or(d.speed, |v| v.clamp(100.0, 100_000.0)),
+            dead_zone: number("VICTORY_MOUSE_LOOK_DEADZONE").map_or(d.dead_zone, |v| (v / 100.0).clamp(0.0, 0.9)),
+            curve: number("VICTORY_MOUSE_LOOK_CURVE").map_or(d.curve, |v| (v / 100.0).clamp(0.2, 4.0)),
+            vertical: number("VICTORY_MOUSE_LOOK_VERTICAL").map_or(d.vertical, |v| (v / 100.0).clamp(-4.0, 4.0)),
+            bank: number("VICTORY_MOUSE_LOOK_BANK").map_or(d.bank, |v| (v / 1000.0).clamp(0.0, 3.0)),
+        })
+    }
+
+    /// The stick for `share` (0 to 1) of the whole speed towards the unit
+    /// vector (`x`, `y`), up positive.
+    fn stick(&self, share: f32, x: f32, y: f32) -> (f32, f32) {
+        let reach = self.dead_zone + (1.0 - self.dead_zone) * share.clamp(0.0, 1.0).powf(self.curve);
+        (x * reach, y * reach)
+    }
+}
+
+/// See [`Look`]; whether the pointer is put back to the middle after each
+/// sample follows it (`lifecycle::captured_mouse_delta`).
+pub(crate) fn mouse_look() -> bool {
+    look().is_some()
+}
+
+fn look() -> Option<Look> {
+    static LOOK: LazyLock<Option<Look>> = LazyLock::new(|| {
+        let look = Look::from(|name| std::env::var(name).ok());
+        if let Some(l) = look
+            && super::lifecycle::enabled("VICTORY_MOUSE_CAPTURE")
+        {
+            tracing::info!(
+                speed = l.speed,
+                dead_zone = l.dead_zone,
+                curve = l.curve,
+                vertical = l.vertical,
+                bank = l.bank,
+                "the captured mouse is the stand-in pad's right stick and triggers (VICTORY_MOUSE_LOOK=0: the mouse device alone)"
+            );
+        }
+        look
+    });
+    *LOOK
+}
+
+/// What the camera still owes the pointer.
+#[derive(Default)]
+struct MouseLook {
+    /// Time and cumulative position of the sample before.
+    last: Option<(u64, i64, i64)>,
+    /// Pixels the pointer has moved that the stick has not turned yet, up
+    /// positive.
+    owed: (f32, f32),
+}
+
+impl MouseLook {
+    /// What the mouse adds to the stand-in pad at `now` (microseconds).
+    fn pad(&mut self, look: &Look, mouse: Option<&MouseState>, now: u64) -> PadState {
+        let Some(mouse) = mouse else {
+            *self = MouseLook::default();
+            return PadState::default();
+        };
+        // Since the sample before: the stick is taken to stand as long again
+        // (a long gap is not one long push).
+        let (seconds, dx, dy) = match self.last {
+            Some((t, x, y)) => (
+                (now.saturating_sub(t) as f32 / 1e6).clamp(0.002, 0.032),
+                (mouse.position_x - x) as f32,
+                (mouse.position_y - y) as f32,
+            ),
+            None => (POLL.as_secs_f32(), 0.0, 0.0),
+        };
+        self.last = Some((now, mouse.position_x, mouse.position_y));
+        let (mut x, mut y) = (self.owed.0 + dx, self.owed.1 - dy * look.vertical);
+        let mut owed = x.hypot(y);
+        // No more is kept than the whole stick turns in `bank` seconds.
+        let most = look.speed * look.bank.max(LOOK_PAY);
+        if owed > most {
+            (x, y) = (x * most / owed, y * most / owed);
+            owed = most;
+        }
+        let (right_x, right_y) = if owed < 0.05 {
+            self.owed = (0.0, 0.0);
+            (0.0, 0.0)
+        } else {
+            let share = (owed / (LOOK_PAY * look.speed)).min(1.0);
+            let left = 1.0 - (share * look.speed * seconds).min(owed) / owed;
+            self.owed = (x * left, y * left);
+            look.stick(share, x / owed, y / owed)
+        };
+        let held = |bit: u32| if mouse.buttons & bit != 0 { 1.0 } else { 0.0 };
+        PadState {
+            buttons: if mouse.buttons & 0x4 != 0 { RIGHT_STICK } else { 0 },
+            left_trigger: held(0x2),
+            right_trigger: held(0x1),
+            right_x,
+            right_y,
+            ..PadState::default()
+        }
     }
 }
 
@@ -406,6 +674,8 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// The mouse as the stand-in pad's stick ([`Look`]).
+    look: MouseLook,
 }
 
 pub struct Hub {
@@ -453,6 +723,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                look: MouseLook::default(),
             }),
             returned: Condvar::new(),
         }));
@@ -540,9 +811,10 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        let looked = look().map_or_else(PadState::default, |l| self.look.pad(&l, mouse.as_ref(), now));
         self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(merged(fallback(&keys), looked), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -551,7 +823,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(merged(fallback(&keys), looked)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1723,6 +1995,187 @@ mod tests {
         // Closing the F1 menu resumes cleanly from the preserved position with no jump.
         let resumed = apply_mouse_sample(&mut mouse, (3, 4), 0b10, false);
         assert_eq!(resumed, MouseState { position_x: 15, position_y: -1, buttons: 0b10, ..Default::default() });
+    }
+
+    fn mouse_at(x: i64, y: i64) -> MouseState {
+        MouseState { position_x: x, position_y: y, ..Default::default() }
+    }
+
+    /// A slow hand holds the stick as far as its speed is of `speed`, past
+    /// the dead zone as soon as it moves, and the stick is at rest again
+    /// soon after the pointer is.
+    #[test]
+    fn the_captured_mouse_is_the_right_stick() {
+        let look = Look { speed: 2000.0, dead_zone: 0.25, curve: 1.0, vertical: 1.0, bank: 0.5 };
+        let mut m = MouseLook::default();
+        assert_eq!(m.pad(&look, Some(&mouse_at(0, 0)), 0), PadState::default());
+        // 8 pixels every 8 ms to the right: 1,000 pixels a second, half the way past the dead zone.
+        let mut pad = PadState::default();
+        for i in 1..=60 {
+            pad = m.pad(&look, Some(&mouse_at(8 * i, 0)), 8_000 * i as u64);
+        }
+        assert!((pad.right_x - 0.625).abs() < 0.005 && pad.right_y == 0.0, "{pad:?}");
+        assert_eq!((pad.buttons, pad.left_trigger, pad.right_trigger, pad.left_x, pad.left_y), (0, 0.0, 0.0, 0.0, 0.0));
+        // The first step is past the dead zone at once, and not a jump to the whole stick.
+        let mut first = MouseLook::default();
+        first.pad(&look, Some(&mouse_at(0, 0)), 0);
+        let step = first.pad(&look, Some(&mouse_at(8, 0)), 8_000);
+        assert!(step.right_x > 0.25 && step.right_x < 0.4, "{step:?}");
+        // The pointer stands still: the stick falls back and is at rest within half a second.
+        for i in 61..=120 {
+            pad = m.pad(&look, Some(&mouse_at(480, 0)), 8_000 * i as u64);
+        }
+        assert_eq!(pad, PadState::default());
+        // No mouse (not captured, or the window not in front): nothing, and nothing kept.
+        m.pad(&look, Some(&mouse_at(880, 0)), 8_000 * 121);
+        assert_eq!(m.pad(&look, None, 8_000 * 122), PadState::default());
+        assert_eq!(m.pad(&look, Some(&mouse_at(9_000, 0)), 8_000 * 123), PadState::default());
+    }
+
+    /// What a fast hand asks beyond the whole stick is turned after it: the
+    /// stick's pushes add up to the pointer's way, up to the bank.
+    #[test]
+    fn a_fast_hand_is_turned_after_and_not_lost() {
+        let look = Look { speed: 2000.0, dead_zone: 0.25, curve: 1.0, vertical: 1.0, bank: 0.5 };
+        // The pixels a pad's stick turns in one 8 ms sample, from its reach.
+        let turned = |pad: &PadState| {
+            let reach = pad.right_x.hypot(pad.right_y);
+            if reach == 0.0 { 0.0 } else { (reach - 0.25) / 0.75 * 2000.0 * 0.008 }
+        };
+        let mut m = MouseLook::default();
+        m.pad(&look, Some(&mouse_at(0, 0)), 0);
+        // 600 pixels in 80 ms (7,500 a second, nearly four times the whole stick), then rest.
+        let (mut sum, mut full) = (0.0, 0);
+        for i in 1..=200_i64 {
+            let pad = m.pad(&look, Some(&mouse_at(60 * i.min(10), 0)), 8_000 * i as u64);
+            assert!(pad.right_x >= 0.0 && pad.right_x <= 1.0 && pad.right_y == 0.0, "{pad:?}");
+            full += i64::from(pad.right_x == 1.0);
+            sum += turned(&pad);
+        }
+        assert!((sum - 600.0).abs() < 2.0, "{sum}");
+        // The whole stick for about (600 - 100) / 16 samples, a quarter of a second, and at rest after.
+        assert!((28..=36).contains(&full), "{full}");
+        assert_eq!(m.pad(&look, Some(&mouse_at(600, 0)), 8_000 * 201), PadState::default());
+        // More than the bank holds (half a second of the whole stick: 1,000 pixels) is let go.
+        let mut m = MouseLook::default();
+        m.pad(&look, Some(&mouse_at(0, 0)), 0);
+        let mut sum = turned(&m.pad(&look, Some(&mouse_at(5_000, 0)), 8_000));
+        for i in 2..=300 {
+            sum += turned(&m.pad(&look, Some(&mouse_at(5_000, 0)), 8_000 * i));
+        }
+        assert!((sum - 1000.0).abs() < 2.0, "{sum}");
+        // With no bank the stick follows the pointer's speed alone: at rest 0.2 s after the same fast move.
+        let none = Look { bank: 0.0, ..look };
+        let mut m = MouseLook::default();
+        m.pad(&none, Some(&mouse_at(0, 0)), 0);
+        let mut pad = PadState::default();
+        for i in 1..=35_i64 {
+            pad = m.pad(&none, Some(&mouse_at(60 * i.min(10), 0)), 8_000 * i as u64);
+        }
+        assert!(pad.right_x < 0.3, "{pad:?}");
+    }
+
+    /// Up on the mouse is up on the stick (the pointer's y grows downwards),
+    /// the direction is kept, and the settings turn and scale it.
+    #[test]
+    fn the_mouse_stick_keeps_the_direction() {
+        let look = Look { speed: 1000.0, dead_zone: 0.0, curve: 1.0, vertical: 1.0, bank: 0.5 };
+        // 3 left and 4 up every 8 ms, steadily: 625 pixels a second, three parts left to four up.
+        let steady = |look: &Look, dx: i64, dy: i64| {
+            let mut m = MouseLook::default();
+            m.pad(look, Some(&mouse_at(0, 0)), 0);
+            let mut pad = PadState::default();
+            for i in 1..=80_i64 {
+                pad = m.pad(look, Some(&mouse_at(dx * i, dy * i)), 8_000 * i as u64);
+            }
+            (pad.right_x, pad.right_y)
+        };
+        let (x, y) = steady(&look, -3, -4);
+        assert!((x + 0.375).abs() < 0.005 && (y - 0.5).abs() < 0.005, "{x} {y}");
+        let inverted = Look { vertical: -1.0, ..look };
+        let (x, y) = steady(&inverted, 0, -4);
+        assert!(x == 0.0 && (y + 0.5).abs() < 0.005, "{x} {y}");
+        let half = Look { vertical: 0.5, ..look };
+        assert!((steady(&half, 0, -4).1 - 0.25).abs() < 0.005);
+        // A curve below 1 lifts slow motion, the dead zone is where it starts.
+        let curved = Look { curve: 0.5, dead_zone: 0.2, ..look };
+        let (x, y) = curved.stick(0.25, 1.0, 0.0);
+        assert!((x - (0.2 + 0.8 * 0.5)).abs() < 1e-4 && y == 0.0, "{x} {y}");
+    }
+
+    /// Left button: right trigger; right button: left trigger; middle: the
+    /// right stick's press.
+    #[test]
+    fn the_mouse_buttons_are_the_triggers() {
+        let mut m = MouseLook::default();
+        let held = |buttons| MouseState { buttons, ..Default::default() };
+        let pad = m.pad(&Look::DEFAULT, Some(&held(0b001)), 0);
+        assert_eq!((pad.right_trigger, pad.left_trigger, pad.buttons), (1.0, 0.0, 0));
+        let pad = m.pad(&Look::DEFAULT, Some(&held(0b110)), 8_000);
+        assert_eq!((pad.right_trigger, pad.left_trigger, pad.buttons), (0.0, 1.0, RIGHT_STICK));
+    }
+
+    /// The mapping is there unless `VICTORY_MOUSE_LOOK=0`, with its numbers
+    /// from the environment, kept within sense.
+    #[test]
+    fn the_mouse_look_settings() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_owned())
+        };
+        assert_eq!(Look::from(env(&[])), Some(Look::DEFAULT));
+        assert_eq!(Look::from(env(&[("VICTORY_MOUSE_LOOK", "0")])), None);
+        assert_eq!(Look::from(env(&[("VICTORY_MOUSE_LOOK", "1")])), Some(Look::DEFAULT));
+        let set = Look::from(env(&[
+            ("VICTORY_MOUSE_LOOK_SPEED", "4500"),
+            ("VICTORY_MOUSE_LOOK_DEADZONE", "15"),
+            ("VICTORY_MOUSE_LOOK_CURVE", "60"),
+            ("VICTORY_MOUSE_LOOK_VERTICAL", "-80"),
+            ("VICTORY_MOUSE_LOOK_BANK", "250"),
+        ]));
+        assert_eq!(set, Some(Look { speed: 4500.0, dead_zone: 0.15, curve: 0.6, vertical: -0.8, bank: 0.25 }));
+        let wild = Look::from(env(&[("VICTORY_MOUSE_LOOK_SPEED", "1"), ("VICTORY_MOUSE_LOOK_DEADZONE", "x")])).unwrap();
+        assert_eq!((wild.speed, wild.dead_zone), (100.0, Look::DEFAULT.dead_zone));
+    }
+
+    /// `VICTORY_PAD_KEYS`: a key given a button is that button alone, the
+    /// other keys stay what the tables say, `pc` is the PC layout, and the
+    /// last word on a key holds.
+    #[test]
+    fn the_start_can_give_the_stand_in_pad_its_keys() {
+        let down = |vks: &[u8]| -> Vec<KeyState> {
+            vks.iter().map(|&vk| KeyState { virtual_key: vk, ..Default::default() }).collect()
+        };
+        // Nothing given: as the tables say (C the right trigger, F the left stick's press).
+        let pad = fallback_with(&down(&[b'C', b'F', b'W']), &[]);
+        assert_eq!((pad.right_trigger, pad.buttons, pad.left_y), (1.0, LEFT_STICK, 1.0));
+        let pc = parse_pad_keys("pc");
+        assert_eq!(pc.len(), 9);
+        // The PC layout: C looks back and is no trigger, F is Y, Shift runs, Space jumps.
+        let pad = fallback_with(&down(&[b'C', b'F', 0xA0, 0x20, b'W']), &pc);
+        assert_eq!((pad.right_trigger, pad.left_y), (0.0, 1.0));
+        assert_eq!(pad.buttons, RIGHT_STICK | Y | A | X);
+        // Keys it does not name stay: Enter is A, E the right bumper, Z the left trigger.
+        let pad = fallback_with(&down(&[0x0D, b'E', b'Z']), &pc);
+        assert_eq!((pad.buttons, pad.left_trigger), (A | RIGHT_SHOULDER, 1.0));
+        // Triggers can be given, a later word replaces an earlier one, nonsense is left out.
+        let keys = parse_pad_keys("pc, G=RT ,f=lt, nonsense, Q=, 7=Up, F=Down");
+        assert_eq!(keys.iter().filter(|(k, _)| *k == b'F').copied().collect::<Vec<_>>(), [(b'F', PadKey::Button(DOWN))]);
+        let pad = fallback_with(&down(&[b'G', b'7', b'F']), &keys);
+        assert_eq!((pad.right_trigger, pad.buttons), (1.0, UP | DOWN));
+        assert!(parse_pad_keys("").is_empty());
+    }
+
+    /// The stand-in pad carries the mouse's stick beside the keyboard's keys.
+    #[test]
+    fn the_stand_in_pad_takes_the_mouse_and_the_keys() {
+        let keys = [KeyState { virtual_key: b'W', ..Default::default() }];
+        let mut m = MouseLook::default();
+        let look = Look { speed: 1000.0, dead_zone: 0.0, curve: 1.0, vertical: 1.0, bank: 0.5 };
+        m.pad(&look, Some(&mouse_at(0, 0)), 0);
+        let mouse = m.pad(&look, Some(&MouseState { buttons: 1, ..mouse_at(25, 0) }), 8_000);
+        let pad = merged(fallback_with(&keys, &[]), mouse);
+        assert_eq!((pad.left_y, pad.right_trigger), (1.0, 1.0));
+        assert!((pad.right_x - 0.5).abs() < 0.01, "{pad:?}");
     }
 
     #[test]

@@ -192,7 +192,11 @@ pub(super) fn captured_mouse_delta() -> Option<(i64, i64)> {
         let mut point = POINT::default();
         if wm::GetCursorPos(&mut point) == 0 { state.reference = None; return None; }
         let point = (point.x, point.y);
-        let warp = std::env::var_os("VICTORY_MOUSE_WARP").is_some_and(|v| v == "1");
+        // Put back to the middle after each sample where the motion is a pad's stick
+        // (`gameinput::mouse_look`): left alone, the pointer stops at the window's edge
+        // and the stick with it. `VICTORY_MOUSE_WARP=1` or `0` asks for either.
+        let warp = std::env::var_os("VICTORY_MOUSE_WARP")
+            .map_or_else(crate::modules::gameinput::mouse_look, |v| v == "1");
         let warped = (warp && wm::SetCursorPos(state.center.0, state.center.1) != 0)
             .then_some(state.center);
         Some(mouse_motion(&mut state.reference, point, warped))
