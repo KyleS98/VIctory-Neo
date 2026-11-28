@@ -1,7 +1,8 @@
 # VIctory-Neo
 
 **The Xbox Series build of the title, running on a Windows PC from your own
-files: about 31 frames a second, and 53 to 132 on screen with frame generation.**
+files: about 37 frames a second at the game's own speed, and 72 on screen with
+frame generation.**
 
 VIctory-Neo is a build of [VIctory](https://github.com/Marvisak/VIctory), the
 compatibility layer that runs an Xbox Series title natively on Windows. The
@@ -21,9 +22,15 @@ shows it), medians over the 5-second readings of a run, hands off.
 
 | Scene | Profile | Frames a second |
 |---|---|---|
-| Prologue, the cell (4,300 to 4,700 draws a frame) | Series S, 1920x1080 out | **31** (readings 27 to 33) |
-| the same | Series S, DLSS Quality and AMD FSR 3 frame generation | **27 rendered, 53 shown** (F3: `FPS: 26.4  FG: 52.8`) |
-| the same | Series S, DLSS Quality and DLSS frame generation through MFG Unlocker (a mod, below), 2x / 3x / 4x / 6x | 24 / 23 / 22.5 / 22 rendered; **48 / 72 / 92 / 132 shown** (F3 at 6x: `FPS: 21.5  FG: 129.0`) |
+| Prologue, the cell (4,300 to 4,700 draws a frame) | Series S, 1920x1080 out | **37** (readings 36 to 38; 30.7 on the build before, the same draws) |
+| the same | Series S, DLSS Quality and AMD FSR 3 frame generation | **35 rendered, 72 shown** (27 and 53 before) |
+| The first house, from a shared save (views of 5,300 to 6,500 draws a frame) | Series S | about 30 |
+
+Measured on the build before (27 November), not again since:
+
+| Scene | Profile | Frames a second |
+|---|---|---|
+| Prologue, the cell | Series S, DLSS Quality and DLSS frame generation through MFG Unlocker (a mod, below), 2x / 3x / 4x / 6x | 24 / 23 / 22.5 / 22 rendered; 48 / 72 / 92 / 132 shown |
 | Opening cutscene | Series S | about 28 on average, 20 to 37 by shot |
 | Prologue, the cell | Series X, scene 1920x1080, 2560x1440 out | 26 |
 | Prologue, the cell | Series X, native 2560x1440 | 23 |
@@ -32,10 +39,13 @@ shows it), medians over the 5-second readings of a run, hands off.
   cutscene play in order, and the prologue's first room stands.
 - Characters, hair, clothes and their prints, textures, sky and sun are drawn.
 - No crash and no lost graphics device in the runs these numbers come from
-  (a dozen, 5 to 10 minutes each, standing in the cell). Longer sessions,
-  play with a pad or keyboard and mouse, and anything past the prologue are
-  **not measured here yet**; the projects this is built on have played to the
-  first boat mission (see [Built on](#built-on)).
+  (some forty on 28 November, 4 to 5 minutes each, hands off; one more, with
+  the tree's sampling profiler switched on, ended in that profiler). Keyboard and
+  mouse were checked by a script in one scene (the mouse turns the camera, W
+  walks), and a shared save from after the prologue loads and plays in the
+  first house. Long sessions and play by hand are **not measured here yet**;
+  the projects this is built on have played to the first boat mission (see
+  [Built on](#built-on)).
 
 On the same PC, fxceless/victory-fork's `main` of the same day runs the same
 cell at 17 to 19 frames a second.
@@ -49,17 +59,25 @@ cell at 17 to 19 frames a second.
   rays: a few frames a second and a broken picture.
 - **Haze through windows.** Bright views through glass (the cell's window)
   are smeared; cause not found yet.
-- **A dark patch on a wall, in some runs.** In about one run in ten, the
+- **A dark patch on a wall, in some runs.** In about one run in eight (on
+  28 November 4 of some 35, on builds with and without the changes below), the
   wall to the left of the character in the cell shows a dark patch with
   blocky edges for the whole run; cause not found yet.
+- **White specks, and bright blotches on floors,** in the first house (on
+  the build before too).
 - **Hitches** when the title streams a new scene in, and during the first
   launches while shaders are translated and pipelines made (see below).
-- **Above 30 frames a second the game runs a little fast.** The title steps
-  its world at least 1/30 s a frame. `--fps 30` holds it at its own rate.
-  (Frames made by frame generation do not count: 27 rendered is 27.)
+- **Rendered frames stop at 60 a second.** The title steps its world at
+  least one frame of its own rate, 30, however short the frame was, so above
+  30 it ran fast. `victory play` now gives it the rate 60 (as its own code
+  takes it; `VICTORY_FRAME_INTERVAL_MS=16.667`), and the game keeps its
+  speed up to 60 rendered frames a second: the same loop of an idle
+  animation took 7.43 s at 36.9 frames a second, 7.33 s at 30, and 6.07 s at
+  36.8 without the setting. `--fps 30` is the title's own rate. (Frames made
+  by frame generation do not count.)
 - **Frame generation adds latency** (about one rendered frame), as it does
   in any game, and its in-between frames can smear fast motion.
-- **Memory.** On this PC it takes up to 43 GB of RAM, with a 24 GB card that
+- **Memory.** On this PC it takes 36 to 42 GB of RAM, with a 24 GB card that
   it fills with textures. Close what you can. foxhound measures 20 GB in use
   (28 GB committed) on a 32 GB PC with a 12 GB card.
 
@@ -111,7 +129,7 @@ start. **The trade-off:** DLSS frame generation costs this card more than
 FSR 3 does (22 to 24 real frames a second instead of 27), and frame
 generation never makes the game answer faster: at 4x you see 92 frames a
 second, but the game still reacts at about 22. For the quickest response
-use FSR 3 at 2x, or no frame generation (31). Keep the shown rate under your
+use FSR 3 at 2x, or no frame generation (37). Keep the shown rate under your
 monitor's refresh rate.
 
 - **The first launches are slow, and that is expected.** The first start
@@ -121,7 +139,7 @@ monitor's refresh rate.
   what it needed, so it gets smoother over the first two or three.
 - **The first start asks once whether to download NVIDIA's DLSS files**
   (RTX cards). Either way works: in the cell DLSS Quality measured 31.4 and
-  Performance 31.7 against 30.9 without it.
+  Performance 31.7 against 30.9 without it (on the build of 27 November).
   The card's time there goes to the number of commands, not to pixels.
 - **Known crash, with a way round it:** with AMD's FSR 3 files fetched and
   `--dlss off`, the start prepares FSR 3 and the program ends during the boot
@@ -137,7 +155,8 @@ Other ways to run it:
 |---|---|
 | `victory.exe play <exe>` | Series X profile at 2560x1440: sharper, slower (23 here) |
 | `victory.exe play <exe> --res 1080to1440` | Series X, scene at 1920x1080 (26 here) |
-| `victory.exe play <exe> --series-s --fps 30` | the title's own frame rate, game speed exact |
+| `victory.exe play <exe> --series-s --fps 30` | the title's own frame rate |
+| `victory.exe play <exe> --series-s --set VICTORY_MOUSE_CAPTURE=1 --set VICTORY_PAD_KEYS=pc` | keyboard and mouse (below) |
 | `victory.exe play <exe> --series-s --set VICTORY_X=1` | add or override a switch |
 | `scripts\play-foxhound.ps1 -Exe <exe> -SeriesS` | the same from PowerShell, with a log file |
 
@@ -147,10 +166,38 @@ NVIDIA's and AMD's, under their licences, fetched from their own GitHub by
 `victory.exe get-dlss` and `get-fsr` and never part of this repository;
 [docs/dlss.md](docs/dlss.md) has the details.
 
+### Keyboard and mouse
+
+The title takes its camera from a controller's right stick alone. With
+`--set VICTORY_MOUSE_CAPTURE=1` (or F1, MOUSE CAPTURE) the mouse is that
+stick: it turns the camera, the left button is the right trigger, the right
+button the left one, the middle button a press of the stick. With
+`--set VICTORY_PAD_KEYS=pc` the keyboard has this layout (the names are the
+Xbox buttons; what each does is the game's choice):
+
+| Key | Button | Key | Button |
+|---|---|---|---|
+| W A S D | left stick | Left Shift | A |
+| Space | X | F | Y |
+| R | B | Tab | LB |
+| Q or E | RB | Left Ctrl | left stick's press |
+| C or H | right stick's press | V | View |
+| Enter | A | Backspace | B |
+| Esc | Menu | arrows | D-pad |
+
+`VICTORY_PAD_KEYS=pc,G=Y,Space=A` changes single keys. The mouse's feel:
+`VICTORY_MOUSE_LOOK_SPEED` (pixels a second that are the whole stick, 2400:
+lower turns more for the same hand), `VICTORY_MOUSE_LOOK_DEADZONE` (percent,
+20: raise it if slow motion does nothing), `VICTORY_MOUSE_LOOK_VERTICAL`
+(percent; negative turns up and down round), `VICTORY_MOUSE_LOOK_BANK`
+(milliseconds of full turning kept after a fast flick, 350),
+`VICTORY_MOUSE_LOOK=0` (off). Checked by a script, not yet tuned by hand.
+
 ## What Neo adds
 
-Two changes on top of the tree it is built on, each measured in the game on
-the PC above and sent to that project as a pull request:
+Changes on top of the tree it is built on, each measured in the game on the
+PC above. The first three were sent to that project as pull requests; the
+others have not been sent yet:
 
 1. **The Series S profile keeps the title's own upscaler** where no DLSS is
    set up. The title picks FSR 4 on a Series S; translated, that is the
@@ -167,16 +214,50 @@ the PC above and sent to that project as a pull request:
    cache, so **the cause of the missing print here is not known yet**: the
    fresh cache is what fixed it, not the order. (Pull request in draft
    until that is tested.)
-In progress, not in the build: **the console's per-lane descriptor loops run
-once instead of once per distinct value** (a [pull request](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/458),
-now in draft). The translator proves only some of these loops and runs the
-rest as loops that cost four group barriers a pass on a card whose waves are
-half as wide as the console's. A check of the loop's shape proved 32,106
-more of them, and the cell went from 31 to 32 to 33 frames a second (62 shown
-with frame generation). It was taken out again because a wall in the cell
-then showed a dark patch in 3 runs of 5. The same patch later turned up
-without the change too (1 run of 10), so it is an older fault; whether the
-change makes it more likely is being measured before it goes back in.
+3. **The console's per-lane descriptor loops run once instead of once per
+   distinct value** (a [pull request](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/458),
+   in draft). The translator proves only some of these loops and runs the
+   rest as loops that cost four group barriers a pass on a card whose waves
+   are half as wide as the console's. A check of the loop's shape proves
+   32,106 more of them: the title's commands take the card 24.4 ms a frame
+   in the cell where they took 27.6 (each command timed on its own), one
+   program alone 3.5 ms less. It was out of the build for a day because a
+   wall in the cell showed a dark patch in 3 runs of 5 with it; the patch
+   turns up as often without it (see above), so it is back in.
+4. **The layer's threads stopped standing in each other's way** (28
+   November). A timeline of the frame showed where they did:
+   - The eight threads that record the title's lists each lost 3.3 of the
+     22 ms a frame they work waiting for one lock, to hand back objects the
+     title had let go of. Each now has a queue of its own.
+   - On a processor of two dies the title keeps its threads on one die
+     (its own choice of sixteen processors) and the layer's ran on both,
+     half the time beside the title's. They now keep to the other die
+     (`VICTORY_OWN_CPUS=auto`), but for the threads that only translate
+     ahead.
+   - Five to eight of the title's threads at a time stood 2 ms and more in
+     their write faults behind the write tracker's lock
+     (`VICTORY_FAULT_UNLOCKED=1`, a switch of the tree's, now on), a store
+     that faults is done beside the guard (`VICTORY_STORE_BESIDE=1`, the
+     same), and a fault asks about its one page where it asked about a
+     region of hundreds of megabytes (17 to 3 ms a frame of the title's
+     threads' time).
+   - The loop that kept the card's clocks up took a tenth of the card here
+     (`VICTORY_CARD_AWAKE=0`).
+   Together with the loops above: 30.7 to 37.1 frames a second in the cell,
+   the same draws, the picture the same within what two runs differ by.
+   What limits it now, each at about 25 ms a frame: the title's own main
+   thread (22 ms of its own work), the layer's thread that prepares the
+   card's work (24 ms), and the card (23 ms).
+5. **The game keeps its speed above 30 frames a second**, and **keyboard and
+   mouse** (both above).
+
+Tried on 28 November and left out, for no gain measured: asking the write
+tracker about a submission's memory on a helper thread beside its start
+(view memory and the kernel's part), reading the pages' last writes with no
+lock, leaving out a barrier's wait where no shader ran since the one before
+(67 of 694 a frame), `VICTORY_GUARD_HOT`, a core of its own for the
+preparing thread, more submissions joined into one (it seemed to bring the
+dark patch more often: 3 runs of 5).
 
 Also in the tree, off by default: `VICTORY_GUARDS_SPIN=<microseconds>`, a
 shorter wait on the write tracker's lock. A profile had the thread that
