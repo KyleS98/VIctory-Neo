@@ -573,6 +573,7 @@ impl HostPipeline {
                     });
                 }
             }
+            super::samplers::know(&t.static_samplers);
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
@@ -1063,9 +1064,6 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        // The host first sees different static samplers in the same order
-        // in every launch (`super::samplers`).
-        super::samplers::before(device, samplers, super::library::dir());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
 }
