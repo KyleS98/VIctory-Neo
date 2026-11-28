@@ -62,7 +62,9 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_CARD_REHASH_RUNS", "1"),
     ("VICTORY_JOIN_COPIES", "1"),
     ("VICTORY_CARD_STEPS", "2"),
-    ("VICTORY_CARD_AWAKE", "1"),
+    // Neo: no loop that keeps the card's clocks up. It took a tenth of the card (RTX 3090 Ti, the
+    // prologue's cell: the card 86 % busy with it and 76 % without, 30.7 and 31.7 frames a second).
+    ("VICTORY_CARD_AWAKE", "0"),
     ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
     ("VICTORY_INDIRECT_WINDOW", "1"),
     ("VICTORY_INDIRECT_BATCH", "2"),
@@ -108,6 +110,17 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_LEAVE_OUT", "02384a60fda6f2d0,731a39171b568298"),
     // Pipelines the title makes are written down, for `victory warm`
     ("VICTORY_PIPELINE_BOOK", "1"),
+    // Neo, measured in the prologue's cell on an RTX 3090 Ti and a Ryzen 9 9950X3D (README):
+    // the title's write faults open their block without the write watch's one lock, and a
+    // store that faults is done beside the guard (one that changes nothing is left out)
+    ("VICTORY_FAULT_UNLOCKED", "1"),
+    ("VICTORY_STORE_BESIDE", "1"),
+    // On a processor of two dies the layer's own threads keep to the die the title does not use
+    ("VICTORY_OWN_CPUS", "auto"),
+    // The title's own rate is 60, not 30: above 30 frames a second it would otherwise step
+    // 1/30 s a frame and run fast (the same loop of an idle animation 6.07 s at 36.8 frames a
+    // second without, 7.43 s with; 7.33 s at 30)
+    ("VICTORY_FRAME_INTERVAL_MS", "16.667"),
 ];
 
 /// Path settings a start keeps from its surroundings; every other
@@ -333,6 +346,11 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     }
     let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
     set("VICTORY_FRAME_INTERVAL_US", &(1_000_000.0 / f64::from(fps)).round().to_string());
+    // The title's own rate with it (`VICTORY_FRAME_INTERVAL_MS`, 60 in `SETTINGS`): a cap under 60
+    // is the rate the title is given too, 30 its own.
+    if (1..60).contains(&fps) {
+        set("VICTORY_FRAME_INTERVAL_MS", &format!("{:.3}", 1000.0 / f64::from(fps)));
+    }
     for (k, v) in menu.iter().filter(|(k, _)| !k.starts_with("VICTORY_MENU_")) {
         if v.is_empty() {
             s.remove(k);
