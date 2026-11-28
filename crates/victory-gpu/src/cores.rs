@@ -86,10 +86,46 @@ fn own_of(asked: &str, all: &[Cpu]) -> Option<Vec<u32>> {
 
 /// Whether the many threads whose work is ahead of what a frame waits for
 /// (lists translated, records made) run on every processor while the others
-/// of ours keep to their own ([`keep_own_threads`]).
+/// of ours keep to their own ([`keep_own_threads`]; `VICTORY_OWN_CPUS_MANY=1`,
+/// off by default: they keep to ours too, see there).
 fn roaming() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_OWN_CPUS").is_some() && std::env::var_os("VICTORY_OWN_CPUS_MANY").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OWN_CPUS").is_some() && std::env::var_os("VICTORY_OWN_CPUS_MANY").is_some_and(|v| v == "1"))
+}
+
+/// The processors our own threads keep to, as the start names them
+/// ([`keep_own_threads`]); `None`: none named.
+fn own() -> Option<&'static Vec<u32>> {
+    static OWN: std::sync::OnceLock<Option<Vec<u32>>> = std::sync::OnceLock::new();
+    OWN.get_or_init(|| {
+        let asked = std::env::var("VICTORY_OWN_CPUS").ok()?;
+        let all = cpus();
+        let own = own_of(&asked, &all);
+        match &own {
+            Some(own) => tracing::info!(asked, processors = own.len(), of = all.len(), "our own threads are kept on these processors (VICTORY_OWN_CPUS)"),
+            None => tracing::warn!(asked, of = all.len(), "VICTORY_OWN_CPUS: no processors of that name, or all of them: left as it is"),
+        }
+        own
+    })
+    .as_ref()
+}
+
+/// How many threads translate the title's lists where the start does not
+/// say (`VICTORY_THIN_THREADS`): eight, or with processors of our own a
+/// quarter as many as those, two to eight.
+///
+/// Eight on sixteen processors of our own, beside the thread that prepares
+/// submissions, its eight helpers and the pools, were more threads than those
+/// processors run at a time: the usual frame was shorter than with the
+/// threads on every processor, and one frame in ten far longer. With four,
+/// five and six in their place (the prologue's cell, Ryzen 9 9950X3D, RTX
+/// 3090 Ti, Series S profile, DLSS off, medians of five-second readings and
+/// the lowest of them): 39.4 and 38.2 frames a second, 38.8 and 37.5, 39.0
+/// and 36.4; with eight 38.4 and 34.3; with eight on every processor 37.4 and
+/// 36.2. The thread that prepares submissions worked 22.8 ms a frame with
+/// four where it worked 24.4.
+pub(crate) fn list_threads() -> usize {
+    own().map_or(8, |own| (own.len() / 4).clamp(2, 8))
 }
 
 /// The processors our own threads run on, where a start names them
@@ -107,22 +143,19 @@ fn roaming() -> bool {
 /// process's default sets, the choice holds for every thread that has neither
 /// an affinity nor sets of its own: ours, the drivers', and not the title's.
 ///
+/// The many threads that translate lists and make records keep to them too
+/// (`VICTORY_OWN_CPUS_MANY=1`: they run on every processor). On the title's
+/// die they took turns with the title's main thread on its two processors
+/// (half of what ran there in a timeline was ours), and that thread's own
+/// work is the longest part of a frame's chain, 22 of 27 ms. Fewer of them
+/// are made in their place ([`list_threads`]).
+///
 /// `VICTORY_OWN_CPUS_ON=0` leaves them as they were (and `VICTORY_AB` can
 /// flip it while the title runs).
 pub(crate) fn keep_own_threads() {
     use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessDefaultCpuSets};
-    static OWN: std::sync::OnceLock<Option<Vec<u32>>> = std::sync::OnceLock::new();
-    let Some(own) = OWN.get_or_init(|| {
-        let asked = std::env::var("VICTORY_OWN_CPUS").ok()?;
-        let all = cpus();
-        let own = own_of(&asked, &all);
-        match &own {
-            Some(own) => tracing::info!(asked, processors = own.len(), of = all.len(), "our own threads are kept on these processors (VICTORY_OWN_CPUS)"),
-            None => tracing::warn!(asked, of = all.len(), "VICTORY_OWN_CPUS: no processors of that name, or all of them: left as it is"),
-        }
-        own
-    }) else {
+    let Some(own) = own() else {
         return;
     };
     // 0: not asked yet; 1: kept; 2: let go.
@@ -203,11 +236,9 @@ fn ask(what: &str, from: u32) {
         let set = unsafe { SetThreadPriority(GetCurrentThread(), priority) } != 0;
         tracing::debug!(what, priority, set, "the thread's priority (VICTORY_HELPER_PRIORITY)");
     }
-    // With processors of our own (`keep_own_threads`): the many threads whose
-    // work is ahead of what a frame waits for run on any (`VICTORY_OWN_CPUS_MANY=0`:
-    // on ours too). They are most of our work, and with them our processors
-    // were more threads than they run at a time: the usual frame 26.5 ms
-    // where it was 29.1, and one frame in ten 41 ms where it was 34.
+    // With processors of our own (`keep_own_threads`) and
+    // `VICTORY_OWN_CPUS_MANY=1`: the many threads whose work is ahead of what
+    // a frame waits for run on any, the title's too.
     if from == 3 && roaming() {
         static ALL: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
         let all = ALL.get_or_init(|| cpus().iter().map(|c| c.id).collect());
