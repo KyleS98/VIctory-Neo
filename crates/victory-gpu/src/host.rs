@@ -5994,6 +5994,7 @@ impl Host {
                 crate::streamline::hudless_submitted(id);
             }
         }
+        crate::cores::keep_own_threads();
         let was_working = working(true);
         submitting(1, runs.len());
         // The round of the heaps' records asked for when the title submitted

@@ -31,6 +31,119 @@ fn cpu_sets() -> Vec<(u32, u8)> {
     sets
 }
 
+/// One of the system's processors (group 0): its set's id, its number, and the
+/// last-level cache it shares.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Cpu {
+    id: u32,
+    logical: u8,
+    cache: u8,
+}
+
+fn cpus() -> Vec<Cpu> {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut bytes = 0u32;
+    // SAFETY: a size query, then the call into a buffer of that size.
+    unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    // SAFETY: as above; the buffer holds `bytes` bytes, aligned for the records.
+    let ok = unsafe { GetSystemCpuSetInformation(buffer.as_mut_ptr().cast(), bytes, &mut bytes, GetCurrentProcess(), 0) };
+    let mut all = Vec::new();
+    let mut at = 0usize;
+    while ok != 0 && at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes as usize {
+        // SAFETY: a record inside the buffer; each says its own size.
+        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_CPU_SET_INFORMATION>()) };
+        if info.Size == 0 {
+            break;
+        }
+        // SAFETY: the record's type is CpuSet (the only one there is).
+        let set = unsafe { &info.Anonymous.CpuSet };
+        if set.Group == 0 {
+            all.push(Cpu { id: set.Id, logical: set.LogicalProcessorIndex, cache: set.LastLevelCacheIndex });
+        }
+        at += info.Size as usize;
+    }
+    all
+}
+
+/// The processors `asked` names among `all`: `<first>-<last>` by their
+/// numbers; `auto`, those of every last-level cache but the one processor 0
+/// has, if there is more than one (a processor of two dies). `None`: not
+/// understood, or none.
+fn own_of(asked: &str, all: &[Cpu]) -> Option<Vec<u32>> {
+    let asked = asked.trim();
+    let chosen: Vec<u32> = if asked.eq_ignore_ascii_case("auto") {
+        let first = all.iter().find(|c| c.logical == 0)?.cache;
+        all.iter().filter(|c| c.cache != first).map(|c| c.id).collect()
+    } else {
+        let (from, to) = asked.split_once('-')?;
+        let (from, to) = (from.trim().parse::<u8>().ok()?, to.trim().parse::<u8>().ok()?);
+        all.iter().filter(|c| (from..=to).contains(&c.logical)).map(|c| c.id).collect()
+    };
+    (!chosen.is_empty() && chosen.len() < all.len()).then_some(chosen)
+}
+
+/// Whether the many threads whose work is ahead of what a frame waits for
+/// (lists translated, records made) run on every processor while the others
+/// of ours keep to their own ([`keep_own_threads`]).
+fn roaming() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OWN_CPUS").is_some() && std::env::var_os("VICTORY_OWN_CPUS_MANY").is_none_or(|v| v != "0"))
+}
+
+/// The processors our own threads run on, where a start names them
+/// (`VICTORY_OWN_CPUS=<first>-<last>`, or `auto`: on a processor of two dies,
+/// the die the title does not use; not given: any, as before).
+///
+/// The title gives each of its threads an affinity of its own, to the
+/// console's sixteen processors: here the first sixteen, on a Ryzen of two
+/// dies one die. Our threads have none and ran on all of them: the thread
+/// that prepares submissions half its time on the title's die, beside the
+/// title's threads on their cores' second halves, and the other half on the
+/// other die, its memory and its locks crossing between the two (a timeline
+/// of the prologue's cell, Ryzen 9 9950X3D: the title's threads on processors
+/// 0 to 15 alone, the preparing thread 48 % there). Asked for as the
+/// process's default sets, the choice holds for every thread that has neither
+/// an affinity nor sets of its own: ours, the drivers', and not the title's.
+///
+/// `VICTORY_OWN_CPUS_ON=0` leaves them as they were (and `VICTORY_AB` can
+/// flip it while the title runs).
+pub(crate) fn keep_own_threads() {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessDefaultCpuSets};
+    static OWN: std::sync::OnceLock<Option<Vec<u32>>> = std::sync::OnceLock::new();
+    let Some(own) = OWN.get_or_init(|| {
+        let asked = std::env::var("VICTORY_OWN_CPUS").ok()?;
+        let all = cpus();
+        let own = own_of(&asked, &all);
+        match &own {
+            Some(own) => tracing::info!(asked, processors = own.len(), of = all.len(), "our own threads are kept on these processors (VICTORY_OWN_CPUS)"),
+            None => tracing::warn!(asked, of = all.len(), "VICTORY_OWN_CPUS: no processors of that name, or all of them: left as it is"),
+        }
+        own
+    }) else {
+        return;
+    };
+    // 0: not asked yet; 1: kept; 2: let go.
+    static APPLIED: AtomicU8 = AtomicU8::new(0);
+    let want = if crate::toggled!("VICTORY_OWN_CPUS_ON") { 1 } else { 2 };
+    if APPLIED.swap(want, Relaxed) == want {
+        return;
+    }
+    // SAFETY: our own process, and a list of the system's own set ids (or none: the default again).
+    let ok = unsafe {
+        if want == 1 {
+            SetProcessDefaultCpuSets(GetCurrentProcess(), own.as_ptr(), own.len() as u32)
+        } else {
+            SetProcessDefaultCpuSets(GetCurrentProcess(), std::ptr::null(), 0)
+        }
+    };
+    if ok == 0 {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "the process's default processor sets could not be set (VICTORY_OWN_CPUS)");
+    }
+}
+
 /// The sets of the fastest class, if there are slower ones too.
 fn fast_of(sets: &[(u32, u8)]) -> Vec<u32> {
     let best = sets.iter().map(|c| c.1).max().unwrap_or(0);
@@ -89,6 +202,40 @@ fn ask(what: &str, from: u32) {
         // SAFETY: this thread's own priority.
         let set = unsafe { SetThreadPriority(GetCurrentThread(), priority) } != 0;
         tracing::debug!(what, priority, set, "the thread's priority (VICTORY_HELPER_PRIORITY)");
+    }
+    // With processors of our own (`keep_own_threads`): the many threads whose
+    // work is ahead of what a frame waits for run on any (`VICTORY_OWN_CPUS_MANY=0`:
+    // on ours too). They are most of our work, and with them our processors
+    // were more threads than they run at a time: the usual frame 26.5 ms
+    // where it was 29.1, and one frame in ten 41 ms where it was 34.
+    if from == 3 && roaming() {
+        static ALL: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+        let all = ALL.get_or_init(|| cpus().iter().map(|c| c.id).collect());
+        // SAFETY: our own thread and a list of the system's own set ids.
+        let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), all.as_ptr(), all.len() as u32) };
+        tracing::debug!(what, ok, "the thread runs on any processor (VICTORY_OWN_CPUS_MANY)");
+    }
+    // An experiment's own word on this kind of thread
+    // (`VICTORY_THREAD_CPUS=<name>=<first>-<last>;<name>=...`, the name a
+    // beginning of the thread's): those processors, whatever the rest says.
+    static BY_NAME: std::sync::OnceLock<Vec<(String, Vec<u32>)>> = std::sync::OnceLock::new();
+    let by_name = BY_NAME.get_or_init(|| {
+        let asked = std::env::var("VICTORY_THREAD_CPUS").unwrap_or_default();
+        let all = cpus();
+        asked
+            .split(';')
+            .filter_map(|part| {
+                let (name, range) = part.split_once('=')?;
+                let own = own_of(range, &all).or_else(|| (range.trim() == "all").then(|| all.iter().map(|c| c.id).collect()))?;
+                tracing::info!(name, processors = own.len(), "threads of this name run on these processors (VICTORY_THREAD_CPUS)");
+                Some((name.trim().to_owned(), own))
+            })
+            .collect()
+    });
+    if let Some((_, own)) = by_name.iter().find(|(name, _)| what.starts_with(name.as_str())) {
+        // SAFETY: our own thread and a list of the system's own set ids.
+        unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), own.as_ptr(), own.len() as u32) };
+        return;
     }
     if stage() < from {
         return;
@@ -162,6 +309,21 @@ impl Priority {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn our_own_processors_are_a_range_or_the_other_caches() {
+        let all: Vec<Cpu> = (0..8u8).map(|n| Cpu { id: 256 + u32::from(n), logical: n, cache: n / 4 }).collect();
+        assert_eq!(own_of("4-7", &all), Some(vec![260, 261, 262, 263]));
+        assert_eq!(own_of(" 6 - 9 ", &all), Some(vec![262, 263]));
+        assert_eq!(own_of("auto", &all), Some(vec![260, 261, 262, 263]));
+        // All of them, none of them, one cache, nonsense: nothing asked for.
+        assert_eq!(own_of("0-7", &all), None);
+        assert_eq!(own_of("9-12", &all), None);
+        let one: Vec<Cpu> = (0..8u8).map(|n| Cpu { id: 256 + u32::from(n), logical: n, cache: 0 }).collect();
+        assert_eq!(own_of("auto", &one), None);
+        assert_eq!(own_of("fast", &all), None);
+        assert!(!cpus().is_empty());
+    }
 
     #[test]
     fn the_fast_cores_are_those_of_the_best_class_if_there_is_a_worse_one() {
