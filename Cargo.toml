@@ -12,6 +12,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [workspace.dependencies]
+mimalloc = { version = "0.1", default-features = false }
 # Internal crates
 victory-core = { path = "crates/victory-core" }
 victory-pe = { path = "crates/victory-pe" }
@@ -71,6 +72,11 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+# One unit a crate and inlining across crates: the thread that prepares
+# submissions spends its frame in small calls from victory-gpu into
+# victory-hle and victory-shader and back.
+lto = "thin"
+codegen-units = 1
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),

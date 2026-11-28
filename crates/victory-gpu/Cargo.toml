@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+mimalloc = { workspace = true, optional = true }
 blake3.workspace = true
 zlib-rs.workspace = true
 tracing.workspace = true
@@ -25,6 +26,9 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+# Our own allocations come from mimalloc (a cache of blocks per thread), not
+# from the process heap that the title's threads and the drivers use too.
+mimalloc = ["dep:mimalloc"]
 
 [lints]
 workspace = true
